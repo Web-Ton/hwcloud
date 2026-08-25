@@ -1,0 +1,1 @@
+self.__SSG_MANIFEST=new Set(["\u002F[locale]","\u002F[locale]\u002Fchangelog","\u002F[locale]\u002Fdocs\u002Farchitecture","\u002F[locale]\u002Fdocs\u002Fconcepts","\u002F[locale]\u002Fdocs\u002Fiac-server"]);self.__SSG_MANIFEST_CB&&self.__SSG_MANIFEST_CB()
