@@ -141,6 +141,15 @@ func (e *ExecutionRuntime) executeReloadSkills(ctx context.Context, session hwcl
 		}
 	}
 	e.loadedSkillsMu.Unlock()
+	// Notify the stream so the ACP server can push available_skills_update
+	// to the client — the frontend skill panel updates in real time after
+	// a reload (install/uninstall on disk).
+	if ch != nil {
+		select {
+		case ch <- hwcloud.StreamEvent{Type: hwcloud.StreamSkillsUpdated, Skills: skills}:
+		case <-ctx.Done():
+		}
+	}
 	return hwcloud.Message{Role: hwcloud.RoleTool, ToolCallID: call.ID, Content: fmt.Sprintf("reloaded %d skills", len(skills))}
 }
 

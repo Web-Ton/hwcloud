@@ -81,6 +81,16 @@ func (c *Client) ConnectStdio(ctx context.Context, env []string, command string,
 	return c.connectIO(ctx, stdin, stdout, subprocessCloser(cmd), &stderrBuf), nil
 }
 
+// ConnectIO wires a [Session] to arbitrary io streams and starts the reader
+// goroutine. Use this for in-process connections (e.g. io.Pipe to a
+// [Server.RunTransport] in the same process) instead of spawning a subprocess.
+//
+// stdin is where the client writes JSON-RPC requests (server reads from it);
+// stdout is where the server writes responses (client reads from it).
+func (c *Client) ConnectIO(ctx context.Context, stdin io.Writer, stdout io.Reader) *Session {
+	return c.connectIO(ctx, stdin, stdout, nil, nil)
+}
+
 // connectIO wires a [Session] to arbitrary io streams and starts the reader
 // goroutine. closer (optional) is invoked by [Session.Close] to tear the
 // transport down; stderr (optional) is surfaced via [Session.Stderr].
@@ -282,6 +292,27 @@ func (s *Session) ListSessions(ctx context.Context, req ListSessionsRequest) (*L
 	return &resp, nil
 }
 
+// ListMessages returns the most recent messages of a session without
+// loading it: session/list_messages.
+func (s *Session) ListMessages(ctx context.Context, req ListMessagesRequest) (*ListMessagesResponse, error) {
+	var resp ListMessagesResponse
+	if err := s.call(ctx, "session/list_messages", req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// ListConfigOptions returns the config options a fresh session would
+// receive (mode, thought level, model selector), without creating one:
+// session/list_config_options.
+func (s *Session) ListConfigOptions(ctx context.Context, req ListConfigOptionsRequest) (*ListConfigOptionsResponse, error) {
+	var resp ListConfigOptionsResponse
+	if err := s.call(ctx, "session/list_config_options", req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
 // SetSessionMode changes the active session mode: session/set_mode.
 func (s *Session) SetSessionMode(ctx context.Context, req SetSessionModeRequest) (*SetSessionModeResponse, error) {
 	var resp SetSessionModeResponse
@@ -426,11 +457,30 @@ func (s *Session) notify(ctx context.Context, method string, params any) error {
 //	https://agentclientprotocol.com/protocol/v1/schema#session%2Fupdate
 type EventHandler interface {
 	// OnAgentMessage — sessionUpdate "agent_message_chunk".
-	OnAgentMessage(text string)
+	// meta carries the update's _meta (nil when absent); loadSession replay
+	// uses it to pass the stored message CreatedAt as "created_at".
+	OnAgentMessage(text string, meta map[string]any)
 	// OnAgentThought — sessionUpdate "agent_thought_chunk".
-	OnAgentThought(text string)
+	// meta carries the update's _meta (see OnAgentMessage).
+	OnAgentThought(text string, meta map[string]any)
 	// OnUserMessage — sessionUpdate "user_message_chunk" (during session/load history replay).
-	OnUserMessage(text string)
+	// meta carries the update's _meta (see OnAgentMessage).
+	OnUserMessage(text string, meta map[string]any)
+	// OnContextCompacting — sessionUpdate "context_compacting": history
+	// compaction started (automatic, or manual via the server-side
+	// /compact command). meta carries "overflow_tokens" and
+	// "total_messages" when available.
+	OnContextCompacting(meta map[string]any)
+	// OnContextCompacted — sessionUpdate "context_compacted": compaction
+	// finished. meta carries "compressed_messages" and "freed_tokens" on
+	// success, "error" on failure.
+	OnContextCompacted(meta map[string]any)
+	// OnRetrying — sessionUpdate "model_retrying": the model call hit a
+	// transient error and the kernel backs off before the next attempt.
+	// meta carries "attempt" (1-based, the upcoming attempt), "max_retries",
+	// "backoff_seconds" and "error". Turn-scoped transient state: never
+	// stored, never replayed.
+	OnRetrying(meta map[string]any)
 	// OnToolCall — sessionUpdate "tool_call" / "tool_call_update".
 	OnToolCall(tc ToolCallUpdate)
 	// OnPlan — sessionUpdate "plan".
@@ -445,6 +495,10 @@ type EventHandler interface {
 	OnUsageUpdate(used, total int, cost *Cost)
 	// OnSessionInfo — sessionUpdate "session_info_update".
 	OnSessionInfo(title string, metadata map[string]any)
+	// OnMcpServers — sessionUpdate "mcp_servers_update": the session's
+	// MCP servers after connect (session create / load / resume). A full
+	// snapshot replace, not a delta.
+	OnMcpServers(servers []McpServerStatus)
 }
 
 // ── Reader goroutine ──
@@ -653,15 +707,15 @@ func (s *Session) dispatchSessionUpdate(params json.RawMessage) {
 	switch u.SessionUpdate {
 	case "agent_message_chunk":
 		if cb := u.ContentAsBlock(); cb != nil {
-			h.OnAgentMessage(cb.Text)
+			h.OnAgentMessage(cb.Text, u.Meta)
 		}
 	case "agent_thought_chunk":
 		if cb := u.ContentAsBlock(); cb != nil {
-			h.OnAgentThought(cb.Text)
+			h.OnAgentThought(cb.Text, u.Meta)
 		}
 	case "user_message_chunk":
 		if cb := u.ContentAsBlock(); cb != nil {
-			h.OnUserMessage(cb.Text)
+			h.OnUserMessage(cb.Text, u.Meta)
 		}
 	case "tool_call", "tool_call_update":
 		title := ""
@@ -669,6 +723,7 @@ func (s *Session) dispatchSessionUpdate(params json.RawMessage) {
 			title = *u.Title
 		}
 		h.OnToolCall(ToolCallUpdate{
+			Meta:       u.Meta,
 			ToolCallID: u.ToolCallID, Title: title,
 			Kind: u.Kind, Status: u.Status,
 			RawInput: u.RawInput, RawOutput: u.RawOutput,
@@ -680,6 +735,12 @@ func (s *Session) dispatchSessionUpdate(params json.RawMessage) {
 		h.OnAvailableCommandsUpdate(u.AvailableCommands)
 	case "current_mode_update":
 		h.OnModeUpdate(u.CurrentModeID)
+	case "context_compacting":
+		h.OnContextCompacting(u.Meta)
+	case "context_compacted":
+		h.OnContextCompacted(u.Meta)
+	case "model_retrying":
+		h.OnRetrying(u.Meta)
 	case "config_option_update":
 		h.OnConfigOptionUpdate(u.ConfigOptions)
 	case "usage_update":
@@ -697,5 +758,7 @@ func (s *Session) dispatchSessionUpdate(params json.RawMessage) {
 			title = *u.Title
 		}
 		h.OnSessionInfo(title, u.Meta)
+	case "mcp_servers_update":
+		h.OnMcpServers(u.McpServers)
 	}
 }

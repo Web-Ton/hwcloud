@@ -4,8 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"sync"
 	"strings"
+	"sync"
 	"testing"
 
 	hwcloud "github.com/Cloud-Developer-Department/hwcloud"
@@ -40,8 +40,8 @@ func (s *fakeStream) Next() bool {
 	return true
 }
 func (s *fakeStream) Current() hwcloud.StreamChunk { return s.chunks[s.i-1] }
-func (s *fakeStream) Err() error                     { return nil }
-func (s *fakeStream) Close() error                   { return nil }
+func (s *fakeStream) Err() error                   { return nil }
+func (s *fakeStream) Close() error                 { return nil }
 
 // planModel is a Model that plays out scripted turns. turns is a list of
 // turns; turn i emits the hwcloud.StreamChunks for turn i, then a final
@@ -148,6 +148,7 @@ func (s *recordingSender) SendToolCallWithMeta(tc openacp.ToolCallUpdate, meta m
 	return s.SendToolCall(tc)
 }
 func (s *recordingSender) SendAvailableCommands(cmds []openacp.AvailableCommand) error { return nil }
+func (s *recordingSender) SendAvailableSkills(skills []openacp.AvailableSkill) error   { return nil }
 func (s *recordingSender) SendModeUpdate(modeID openacp.SessionModeId) error           { return nil }
 func (s *recordingSender) SendConfigOptionUpdate(opts []openacp.SessionConfigOption) error {
 	return nil

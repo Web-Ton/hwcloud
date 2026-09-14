@@ -28,11 +28,10 @@ go.work.sum
 bin/
 build/
 
-# build.sh produces the default-named binaries at the repo root.
-# A branded build (HWCLOUD_BINARY_NAME=<name>) emits <name>/<name>-tui
-# instead; those are left for the developer to clean up.
+# build.sh produces the default-named binary at the repo root.
+# A branded build (HWCLOUD_BINARY_NAME=<name>) emits <name> instead;
+# that is left for the developer to clean up.
 /hwcloud
-/hwcloud-tui
 
 # WASM plugin binaries (compiled from examples/plugin/)
 plugins/
@@ -45,13 +44,19 @@ Cargo.lock
 # env file
 .env
 
+# kept under ./tmp for local reference; not versioned
+tmp
+
 # Editor/IDE
 # .idea/
 # .vscode/
 
-# Frontend (Vue/Vite)
+# Frontend
 node_modules/
 dist/
 *.local
 *.tsbuildinfo
 .DS_Store
+
+# temp scratch (handoff, ad-hoc notes)
+.tmp/

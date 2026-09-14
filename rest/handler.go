@@ -47,8 +47,8 @@ type ModelInfo struct {
 type Handler struct {
 	defaultModel hwcloud.Model
 	models       map[string]hwcloud.Model // "provider/modelID" → model instance
-	modelConfigs map[string]ModelConfig     // "provider/modelID" → original apiKey/baseURL, for SetModel fallback
-	modelList    []ModelInfo                // ordered list for /models endpoint
+	modelConfigs map[string]ModelConfig   // "provider/modelID" → original apiKey/baseURL, for SetModel fallback
+	modelList    []ModelInfo              // ordered list for /models endpoint
 	modelsMu     sync.RWMutex
 
 	cfg       *agent.Agent  // template configuration (cloned per session)
@@ -81,7 +81,7 @@ func NewHandler(cfg *agent.Agent, deps kernel.Deps) *Handler {
 	}
 	// One shared background extractor per server (never per run).
 	if h.deps.Extractor == nil && h.deps.MemoryProvider != nil && h.cfg.Model != nil {
-		h.deps.Extractor = ctxpkg.NewAsyncExtractor(ctxpkg.NewLLMExtractor(h.cfg.Model, h.deps.MemoryProvider))
+		h.deps.Extractor = ctxpkg.NewAsyncExtractor(ctxpkg.NewLLMExtractor(func() hwcloud.Model { return h.cfg.Model }, h.deps.MemoryProvider))
 	}
 
 	bus := eventbus.New[SSEEvent](500)

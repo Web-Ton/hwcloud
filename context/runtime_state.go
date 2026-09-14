@@ -17,7 +17,7 @@ type ExecutionState struct {
 
 // ApprovalRecord is one policy decision for a tool call.
 type ApprovalRecord struct {
-	Call   hwcloud.ToolCall        `json:"call"`
+	Call   hwcloud.ToolCall          `json:"call"`
 	Tool   string                    `json:"tool"`
 	Action governance.ApprovalAction `json:"action"`
 	Reason string                    `json:"reason"`

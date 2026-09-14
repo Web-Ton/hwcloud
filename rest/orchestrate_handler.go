@@ -11,8 +11,8 @@ import (
 
 	hwcloud "github.com/Cloud-Developer-Department/hwcloud"
 	"github.com/Cloud-Developer-Department/hwcloud/agent"
-	"github.com/Cloud-Developer-Department/hwcloud/governance"
 	"github.com/Cloud-Developer-Department/hwcloud/eventbus"
+	"github.com/Cloud-Developer-Department/hwcloud/governance"
 	"github.com/Cloud-Developer-Department/hwcloud/kernel"
 	"github.com/Cloud-Developer-Department/hwcloud/orchestrate"
 	"github.com/Cloud-Developer-Department/hwcloud/session"

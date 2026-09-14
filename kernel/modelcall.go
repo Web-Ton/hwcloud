@@ -29,7 +29,17 @@ func (rt *Runtime) callModel(ctx context.Context, req hwcloud.ChatCompletionRequ
 			if errors.As(lastErr, &re) && re.RetryAfter > 0 {
 				backoff = re.RetryAfter
 			}
-			chSend(ctx, ch, hwcloud.StreamEvent{Type: hwcloud.StreamRetrying, Error: lastErr})
+			chSend(ctx, ch, hwcloud.StreamEvent{
+				Type:  hwcloud.StreamRetrying,
+				Error: lastErr,
+				Retry: &hwcloud.RetryInfo{
+					Model:          req.Model,
+					Attempt:        attempt,
+					MaxRetries:     maxRetries,
+					BackoffSeconds: backoff.Seconds(),
+					Error:          lastErr,
+				},
+			})
 			select {
 			case <-time.After(backoff):
 			case <-ctx.Done():

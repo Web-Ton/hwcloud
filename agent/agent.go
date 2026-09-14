@@ -33,14 +33,25 @@ type Agent struct {
 	SystemPrompts []string
 
 	Model    hwcloud.Model
-	Prompt   hwcloud.PromptBuilder // nil = default build prompt
-	InGuard  governance.InputGuard    // nil = no input guard
-	OutGuard governance.OutputGuard   // nil = no output guard
+	Prompt   hwcloud.PromptBuilder  // nil = default build prompt
+	InGuard  governance.InputGuard  // nil = no input guard
+	OutGuard governance.OutputGuard // nil = no output guard
 
 	// Configuration
-	MaxTurns            int // max loop iterations, 0 = default (20)
-	MaxWorkingTokens    int // max tokens for working set before compaction; 0 = 70% of model context window
-	MaxCompressedTokens int // max tokens for compressed summary, 0 = no limit (default 8192)
+	MaxTurns            int // max loop iterations; 0 = fallback to 500 (New sets 500).
+	MaxWorkingTokens    int // max tokens for working set before compaction; 0 = 70% of model context window, or 20000 if unknown
+	MaxCompressedTokens int // max tokens for compressed summary; 0 = no limit. New sets 8192.
+
+	// CompactRatio is the fraction of the working-set budget to COMPRESS away
+	// when auto-compaction triggers (0–1). 0.8 (default) means: when the
+	// working set exceeds the budget, compress 80% of it into the summary and
+	// keep only the most recent 20%. This leaves a large headroom so the next
+	// several turns (tool results, model replies) fit without re-triggering
+	// compaction every turn — the "compress just the overflow" strategy leaves
+	// the working set flush against the budget, so any new message trips it
+	// again (a positive-feedback loop where summary growth shrinks the budget
+	// faster than compaction frees it).
+	CompactRatio float64
 
 	// ReasoningEffort is passed through to the Model's ChatCompletionRequest
 	// for providers that support it (OpenAI o-series, Anthropic extended thinking).
@@ -72,7 +83,7 @@ type SubAgent struct {
 	Tools []string
 	// Model overrides the parent model (nil = inherit).
 	Model hwcloud.Model
-	// MaxTurns caps the sub-agent loop; 0 = default (3).
+	// MaxTurns caps the sub-agent loop; 0 = fallback to 30.
 	MaxTurns int
 }
 
@@ -80,8 +91,9 @@ type SubAgent struct {
 func New(name string, opts ...Option) *Agent {
 	a := &Agent{
 		Name:                name,
-		MaxTurns:            20,
+		MaxTurns:            500,
 		MaxCompressedTokens: 8192,
+		CompactRatio:        0.8,
 	}
 	for _, opt := range opts {
 		if opt != nil {

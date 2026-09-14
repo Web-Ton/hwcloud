@@ -22,7 +22,7 @@ import (
 // Model to produce incremental summaries.
 type Compressor struct {
 	mu        sync.RWMutex
-	model     hwcloud.Model
+	modelFn   func() hwcloud.Model
 	maxTokens int // 0 = no hint; non-zero = prompt the model to keep the summary under this
 	// backoff returns the wait before retry attempt N (1-based). nil uses
 	// the default exponential backoff. Overridable in tests to avoid sleeps.
@@ -31,7 +31,14 @@ type Compressor struct {
 
 // New creates a Compressor backed by m.
 func New(m hwcloud.Model) *Compressor {
-	return &Compressor{model: m}
+	return &Compressor{modelFn: func() hwcloud.Model { return m }}
+}
+
+// NewWithLookup creates a Compressor that resolves the model at call time
+// via modelFn, so api_key/base_url changes in the registry propagate
+// without an explicit SetModel call.
+func NewWithLookup(modelFn func() hwcloud.Model) *Compressor {
+	return &Compressor{modelFn: modelFn}
 }
 
 // SetModel updates the model used for summarization. Safe to call
@@ -39,7 +46,15 @@ func New(m hwcloud.Model) *Compressor {
 func (c *Compressor) SetModel(m hwcloud.Model) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.model = m
+	c.modelFn = func() hwcloud.Model { return m }
+}
+
+// SetModelFn updates the model resolver. Use this for dynamic model
+// lookup (e.g. from a registry that may be updated at runtime).
+func (c *Compressor) SetModelFn(fn func() hwcloud.Model) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.modelFn = fn
 }
 
 // WithMaxTokens sets a SOFT target for the summary size: the budget is
@@ -61,8 +76,12 @@ func (c *Compressor) WithMaxTokens(n int) *Compressor {
 // ThroughIndex is left at zero (the caller sets it).
 func (c *Compressor) Summarize(ctx context.Context, messages []hwcloud.Message, previous *hwcloud.CompressedContext) (*hwcloud.CompressedContext, error) {
 	c.mu.RLock()
-	model := c.model
+	modelFn := c.modelFn
 	c.mu.RUnlock()
+	var model hwcloud.Model
+	if modelFn != nil {
+		model = modelFn()
+	}
 	if model == nil {
 		return nil, fmt.Errorf("summarizer: no model configured")
 	}
@@ -79,18 +98,24 @@ func (c *Compressor) Summarize(ctx context.Context, messages []hwcloud.Message, 
 	// backoff. The per-call timeout below is the primary defense against a
 	// hung gateway: without it a single 504 blocks the run for up to the
 	// model client's HTTP timeout (5m), and with retries that compounds to
-	// ~10m of dead time before the error surfaces. Retries stay modest
+	// ~15m of dead time before the error surfaces. Retries stay modest
 	// (2, not 5) because compaction runs on the prepare-memory critical
-	// path every turn — a persistently failing gateway is better fast-
-	// failed (degrade to tail-trim in prepare.go) than retried into a
-	// multi-minute stall.
+	// path — a persistently failing gateway is better fast-failed (degrade
+	// to tail-trim in prepare.go) than retried into a long stall.
+	//
+	// 3 minutes per call: a large compaction (80% of the working set folded
+	// into an existing summary) sends a big prompt to the summarizer model,
+	// and 90s was too tight for slow gateways — the manual /compact path
+	// (which compresses the entire session) regularly timed out. With the
+	// 80% CompactRatio, compaction fires far less often (once every many
+	// turns, not every turn), so a longer per-call wait is acceptable.
 	//
 	// Backoff sequence (seconds): 2, 4 — 2 retries, ~6s total.
 	// A provider-supplied RetryAfter (e.g. 429 Retry-After header) overrides
 	// the computed value for that attempt.
 	const (
-		maxRetries    = 2
-		callTimeout   = 90 * time.Second
+		maxRetries  = 2
+		callTimeout = 3 * time.Minute
 	)
 	var lastErr error
 	var resp *hwcloud.ChatCompletionResponse
@@ -127,8 +152,9 @@ func (c *Compressor) Summarize(ctx context.Context, messages []hwcloud.Message, 
 		}
 		// A per-call timeout surfaces as context.DeadlineExceeded, which is
 		// NOT a RetryableError — it fails fast instead of retrying into
-		// another 90s stall. This is intentional: a gateway slow enough to
-		// trip 90s is unlikely to recover on the immediate next attempt.
+		// another 3-minute stall. This is intentional: a gateway slow enough
+		// to trip the timeout is unlikely to recover on the immediate next
+		// attempt.
 		var re *hwcloud.RetryableError
 		if !errors.As(err, &re) {
 			return nil, fmt.Errorf("summarizer: model call: %w", err)
@@ -248,4 +274,3 @@ func truncateContent(s string, n int) string {
 	}
 	return string(runes[:n-3]) + "..."
 }
-

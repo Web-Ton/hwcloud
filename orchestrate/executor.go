@@ -20,7 +20,7 @@ type executor struct {
 	agents     map[string]agent.AgentRunner
 	agentInfos []agent.AgentInfo
 	model      hwcloud.Model // for summarisation
-	sessionID  string          // base session id for step isolation
+	sessionID  string        // base session id for step isolation
 	// planRunID is the plan-level run ID (#1): stable across replan
 	// (all replan steps join the same planRunID) and resume (read back
 	// from PlanState.PlanRunID). Stamped on ctx by Plan.execute so each

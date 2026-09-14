@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -27,7 +28,10 @@ import (
 	wasm "github.com/Cloud-Developer-Department/hwcloud/plugin/agent/wasm"
 	"github.com/Cloud-Developer-Department/hwcloud/plugin/wasmhost"
 	"github.com/Cloud-Developer-Department/hwcloud/process"
+	"github.com/Cloud-Developer-Department/hwcloud/provider/skill"
 	"github.com/Cloud-Developer-Department/hwcloud/session"
+	fs "github.com/Cloud-Developer-Department/hwcloud/skill/fs"
+	builtinskills "github.com/Cloud-Developer-Department/hwcloud/skills"
 	"github.com/Cloud-Developer-Department/hwcloud/slash"
 	"github.com/Cloud-Developer-Department/hwcloud/summarizer"
 	opentool "github.com/Cloud-Developer-Department/hwcloud/tool"
@@ -41,11 +45,30 @@ import (
 //	srv := acp.NewAgentServer(agent, mem, sessionStore)
 //	server := openacpsdk.NewServer("my-agent", "1.0.0", srv)
 //	server.Run(ctx)
+//
+// ReloadResult describes what happened during a settings reload.
+type ReloadResult struct {
+	Applied    []string // changes applied (e.g. "log level: info→trace")
+	Violations []string // enum violations found (reload blocked if non-empty)
+	ParseError string   // non-empty if the config failed to parse
+}
+
+// SettingsCallbacks are injected by the server package so the /settings
+// slash command and the settings tool can operate on settings.json without
+// the acp package importing cmd/cli/config.
+type SettingsCallbacks struct {
+	List     func() (string, error)                            // list all settings
+	Get      func(key string) (string, error)                  // get a setting by dotted path
+	Set      func(key, value string) error                     // set a setting (dotted path + value)
+	Validate func() (warnings, violations []string, err error) // validate settings
+	Reload   func(ctx context.Context) ReloadResult            // reload settings (validate + apply)
+}
+
 type AgentServer struct {
 	Cfg     *agent.Agent // template configuration (cloned per turn)
 	Deps    kernel.Deps  // template runtime deps (derived per turn)
 	Mem     session.SessionStore
-	Runtime session.Runtime            // session lifecycle (meta + messages), nil-safe halves
+	Runtime session.Runtime          // session lifecycle (meta + messages), nil-safe halves
 	Models  map[string]hwcloud.Model // model id → Model
 
 	mu       sync.Mutex
@@ -56,6 +79,18 @@ type AgentServer struct {
 	clientRPC    openacp.ClientRequester
 	updateSender openacp.SessionUpdateSender
 	cmdRegistry  *slash.Registry // slash command dispatch
+
+	// turnTrigger is set by the SDK mux via TurnTriggerUser. It lets the
+	// server start an idle turn (no client prompt) to process async
+	// sub-agent completions. nil when no trigger is wired (CLI one-shot).
+	turnTriggerMu sync.RWMutex
+	turnTrigger   openacp.TurnTrigger
+
+	// settingsCB is injected by the server package so the /settings slash
+	// command and the settings tool can operate on settings.json without
+	// the acp package importing cmd/cli/config. Guarded by settingsCBMu.
+	settingsCBMu sync.RWMutex
+	settingsCB   SettingsCallbacks
 
 	// clientCaps holds the capabilities advertised by the client during
 	// initialize. Guarded by mu. Used to gate Agent→Client RPC tool
@@ -82,6 +117,13 @@ type AgentServer struct {
 	// NewAgentServer); set false to disable MCP tool integration.
 	MCPEnabled bool
 
+	// settingsMcpServers are MCP servers declared in settings.json (the
+	// global config). They are merged with client-advertised servers
+	// (req.McpServers) at session create/load/resume — client wins on name
+	// conflict. Guarded by mcpMu so the settings watcher can hot-swap them.
+	settingsMcpServers []openacp.McpServer
+	mcpMu              sync.RWMutex
+
 	// Plugin manager and model config backup for runtime_set_model_config.
 	PluginMgr    *wasm.Manager
 	modelConfigs map[string]ModelConfig // "provider/modelID" → original config
@@ -107,31 +149,33 @@ type AgentServer struct {
 	// the agent template's SystemPrompts are used as-is.
 	ProfileResolver func(cwd string) []string
 
-	// DefaultMode is the mode new sessions start in; "" = "manual"
-	// (approval-based safe default). Configured via settings
-	// "default_mode": "auto" | "manual" | "plan".
+	// DefaultMode is the mode new sessions start in; "" = "semi-auto"
+	// (auto-allow safe calls, prompt for destructive). Configured via
+	// settings "default_mode": "auto" | "semi-auto" | "manual" | "plan".
 	DefaultMode string
 }
 
 // defaultMode resolves the configured default mode.
 func (s *AgentServer) defaultMode() string {
-	if s.DefaultMode == "auto" || s.DefaultMode == "plan" {
+	switch s.DefaultMode {
+	case "auto", "semi-auto", "manual", "plan":
 		return s.DefaultMode
 	}
-	return "manual"
+	return "semi-auto"
 }
 
 // ModelConfig stores the original apiKey/baseURL for a registered model,
 // so SetModel can preserve values when only model_id changes.
 type ModelConfig struct {
-	Provider               string
-	ModelID                string
-	APIKey                 string
-	BaseURL                string
-	MaxOutputTokens        int
-	InputCostPerToken      float64
-	InputCacheCostPerToken float64
-	OutputCostPerToken     float64
+	Provider                 string
+	ModelID                  string
+	APIKey                   string
+	BaseURL                  string
+	MaxInputTokens           int
+	MaxOutputTokens          int
+	InputCostPerMillion      float64
+	InputCacheCostPerMillion float64
+	OutputCostPerMillion     float64
 }
 
 // agentSession holds per-session runtime state.
@@ -170,7 +214,7 @@ type agentSession struct {
 	// (applyModeTools); Runtime never calls back into agentSession, so
 	// there is no inversion.
 	modeMu       sync.RWMutex
-	mode         string                          // "auto", "manual", or "plan"
+	mode         string                          // "auto", "semi-auto", "manual", or "plan"
 	previousMode string                          // mode saved when plan was entered; used by exit_plan_mode
 	config       map[openacp.SessionConfigId]any // config option values
 	cancel       context.CancelFunc
@@ -188,9 +232,10 @@ type agentSession struct {
 	// MCP server configs from session creation.
 	mcpServers []openacp.McpServer
 
-	// Connected MCP sessions. Populated on session create/load/resume;
-	// closed on session close/delete.
-	mcpSessions []*mcp.Session
+	// Connected MCP servers, one conn per configured server (live session
+	// + connect outcome). Populated on session create/load/resume; closed
+	// on session close/delete.
+	mcpConns mcpConns
 
 	// MCP tools imported from all connected servers. Populated once at
 	// connect time; injected into the session runtime.
@@ -466,17 +511,16 @@ func NewAgentServer(cfg *agent.Agent, deps kernel.Deps, store session.Store, mod
 	s.approvalMemory = governance.NewPersistentApprovalMemory(s.Runtime)
 	// One shared background extractor per server (never per run).
 	if deps.Extractor == nil && deps.MemoryProvider != nil && cfg.Model != nil {
-		s.Deps.Extractor = ctxpkg.NewAsyncExtractor(ctxpkg.NewLLMExtractor(cfg.Model, deps.MemoryProvider))
+		s.Deps.Extractor = ctxpkg.NewAsyncExtractor(ctxpkg.NewLLMExtractor(func() hwcloud.Model { return cfg.Model }, deps.MemoryProvider))
 	}
 	s.cmdRegistry = s.buildCommandRegistry()
 	if s.Models == nil {
 		s.Models = make(map[string]hwcloud.Model)
 	}
-	// Pick the first model as the default.
-	for id := range s.Models {
-		s.defaultModelID = id
-		break
-	}
+	// Pick the default model deterministically (sorted keys) so the fallback
+	// is stable across runs, not a random map-iteration order. SetDefaultModelID
+	// overrides this with settings "model" when configured.
+	s.defaultModelID = firstModelIDLocked(s.Models)
 	return s
 }
 
@@ -490,6 +534,56 @@ func (s *AgentServer) SetClientRequester(r openacp.ClientRequester) {
 
 var _ openacp.ClientRPCUser = (*AgentServer)(nil)
 var _ openacp.AgentHandler = (*AgentServer)(nil)
+var _ openacp.TurnTriggerUser = (*AgentServer)(nil)
+
+// SetSettingsCallbacks injects the settings operation callbacks so the
+// /settings slash command can list/get/set/validate settings.json without
+// the acp package importing cmd/cli/config. Called by the server package
+// at startup.
+func (s *AgentServer) SetSettingsCallbacks(cb SettingsCallbacks) {
+	s.settingsCBMu.Lock()
+	defer s.settingsCBMu.Unlock()
+	s.settingsCB = cb
+}
+
+// SetTurnTrigger implements openacp.TurnTriggerUser. The SDK mux injects a
+// function the server calls to start an idle turn (no client prompt) — used
+// when an async sub-agent completes and the model needs to process the result
+// immediately, not "whenever the user comes back". The trigger acquires the
+// same per-session lock as a client prompt, so idle turns and user turns are
+// fully serialized.
+func (s *AgentServer) SetTurnTrigger(trigger openacp.TurnTrigger) {
+	s.turnTriggerMu.Lock()
+	s.turnTrigger = trigger
+	s.turnTriggerMu.Unlock()
+}
+
+// triggerIdleTurn calls the injected turn trigger if one is wired. Returns
+// false when no trigger is available (CLI one-shot, or SDK not yet wired) —
+// the caller falls back to synchronous execution in that case.
+func (s *AgentServer) triggerIdleTurn(sid openacp.SessionId, text string) bool {
+	s.turnTriggerMu.RLock()
+	trigger := s.turnTrigger
+	s.turnTriggerMu.RUnlock()
+	if trigger == nil {
+		return false
+	}
+	go trigger(sid, text)
+	return true
+}
+
+// killSubAgents cancels every running async sub-agent for a session and
+// clears the registry. Called on session close/delete so background goroutines
+// don't outlive the session.
+func (s *AgentServer) killSubAgents(ss *agentSession) {
+	rt := ss.getRuntime()
+	if rt == nil {
+		return
+	}
+	if reg := rt.SubAgentRegistry(); reg != nil {
+		reg.KillAll()
+	}
+}
 
 // SetModel replaces or inserts a model in the registry. Used by
 // runtime_set_model_config. When the model already exists, empty apiKey
@@ -528,10 +622,11 @@ func (s *AgentServer) SetModel(provider, modelID, apiKey, baseURL string, maxInp
 	s.Models[key] = m
 	s.modelConfigs[key] = ModelConfig{
 		Provider: provider, ModelID: modelID, APIKey: apiKey, BaseURL: baseURL,
-		MaxOutputTokens:        mot,
-		InputCostPerToken:      old.InputCostPerToken,
-		InputCacheCostPerToken: old.InputCacheCostPerToken,
-		OutputCostPerToken:     old.OutputCostPerToken,
+		MaxInputTokens:           cw,
+		MaxOutputTokens:          mot,
+		InputCostPerMillion:      old.InputCostPerMillion,
+		InputCacheCostPerMillion: old.InputCacheCostPerMillion,
+		OutputCostPerMillion:     old.OutputCostPerMillion,
 	}
 }
 
@@ -545,21 +640,59 @@ func (s *AgentServer) SetEmbedding(baseURL, apiKey, model string) {
 	}
 }
 
-// modelIDs returns the registered model ids under modelsMu. SetModel
+// modelIDs returns the registered model ids under modelsMu, sorted. SetModel
 // (wasm runtime_set_model_config) can insert concurrently from a tool
-// goroutine, so all iterations must go through this helper.
-func (s *AgentServer) modelIDs() []string {
+// goroutine, so all iterations must go through this helper. Sorting keeps
+// the /models panel and config options deterministic — map iteration order
+// is randomized per call, which shuffled the list between opens. Same order
+// firstModelIDLocked uses for the default fallback.
+func (s *AgentServer) ModelIDs() []string {
 	s.modelsMu.Lock()
 	defer s.modelsMu.Unlock()
 	ids := make([]string, 0, len(s.Models))
 	for id := range s.Models {
 		ids = append(ids, id)
 	}
+	sort.Strings(ids)
 	return ids
 }
 
+// RemoveModel removes a model from the registry. Called by the settings
+// watcher when a provider/model is removed from settings.json. Existing
+// sessions referencing the removed model keep their runtime snapshot
+// (rt.Model() returns the last-used model), but new sessions will not
+// be able to select it.
+//
+// If the removed model was the default, the default falls back to the
+// first remaining model (sorted keys, deterministic) so background
+// components (guard/summarizer/extractor) that resolve via
+// GetDefaultModelID don't get a stale key that LookupModel can't find.
+func (s *AgentServer) RemoveModel(key string) {
+	s.modelsMu.Lock()
+	defer s.modelsMu.Unlock()
+	delete(s.Models, key)
+	delete(s.modelConfigs, key)
+	if s.defaultModelID == key {
+		s.defaultModelID = firstModelIDLocked(s.Models)
+	}
+}
+
+// firstModelIDLocked returns the first model id by sorted key order, or
+// "" when the registry is empty. Caller must hold modelsMu.
+func firstModelIDLocked(models map[string]hwcloud.Model) string {
+	ids := make([]string, 0, len(models))
+	for id := range models {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	if len(ids) > 0 {
+		return ids[0]
+	}
+	return ""
+}
+
 // lookupModel returns the model registered under id, under modelsMu.
-func (s *AgentServer) lookupModel(id string) (hwcloud.Model, bool) {
+func (s *AgentServer) LookupModel(id string) (hwcloud.Model, bool) {
 	s.modelsMu.Lock()
 	defer s.modelsMu.Unlock()
 	m, ok := s.Models[id]
@@ -581,7 +714,7 @@ func (s *AgentServer) SetDefaultModelID(id string) bool {
 
 // getDefaultModelID returns the default model id under modelsMu
 // (SetDefaultModelID runs concurrently from the serve loop).
-func (s *AgentServer) getDefaultModelID() string {
+func (s *AgentServer) GetDefaultModelID() string {
 	s.modelsMu.Lock()
 	defer s.modelsMu.Unlock()
 	return s.defaultModelID
@@ -593,20 +726,23 @@ func (s *AgentServer) RegisterModel(key, provider, modelID, apiKey, baseURL stri
 	defer s.modelsMu.Unlock()
 	s.modelConfigs[key] = ModelConfig{
 		Provider: provider, ModelID: modelID, APIKey: apiKey, BaseURL: baseURL,
-		MaxOutputTokens:        pricing.MaxOutputTokens,
-		InputCostPerToken:      pricing.InputCostPerToken,
-		InputCacheCostPerToken: pricing.InputCacheCostPerToken,
-		OutputCostPerToken:     pricing.OutputCostPerToken,
+		MaxInputTokens:           pricing.MaxInputTokens,
+		MaxOutputTokens:          pricing.MaxOutputTokens,
+		InputCostPerMillion:      pricing.InputCostPerMillion,
+		InputCacheCostPerMillion: pricing.InputCacheCostPerMillion,
+		OutputCostPerMillion:     pricing.OutputCostPerMillion,
 	}
 }
 
 // ModelPricing carries the per-model capability/cost metadata (from the
-// settings models config) used for usage reporting.
+// settings models config) used for usage reporting. Costs are USD per 1M
+// tokens (matching OpenRouter/litellm convention).
 type ModelPricing struct {
-	MaxOutputTokens        int
-	InputCostPerToken      float64
-	InputCacheCostPerToken float64
-	OutputCostPerToken     float64
+	MaxInputTokens           int
+	MaxOutputTokens          int
+	InputCostPerMillion      float64
+	InputCacheCostPerMillion float64
+	OutputCostPerMillion     float64
 }
 
 // resolveModelConfig returns the provider and bare model ID for the current
@@ -634,11 +770,11 @@ func (s *AgentServer) resolveModelConfig(ss *agentSession) (provider, modelID st
 // critical for oaSession.Model in OnPrompt so run()'s session.Model
 // override does not defeat a mid-session model switch.
 func (s *AgentServer) resolveSessionModel(ss *agentSession) hwcloud.Model {
-	key := s.getDefaultModelID()
+	key := s.GetDefaultModelID()
 	if val, ok := ss.ConfigString("model"); ok {
 		key = val
 	}
-	m, _ := s.lookupModel(key)
+	m, _ := s.LookupModel(key)
 	return m
 }
 
@@ -650,12 +786,10 @@ func (s *AgentServer) switchSessionModel(ss *agentSession, m hwcloud.Model) {
 	if rt := ss.getRuntime(); rt != nil {
 		rt.SetModel(m)
 	}
-	if s.Summarizer != nil {
-		s.Summarizer.SetModel(m)
-	}
-	if s.Extractor != nil {
-		s.Extractor.SetModel(m)
-	}
+	// Summarizer and extractor use dynamic model lookup (SetModelFn) in
+	// ACP mode, so they pick up registry updates automatically — no need
+	// to call SetModel here. rt.SetModel above updates the session runtime,
+	// which is the per-session model switch.
 }
 
 // ── Client capability helpers ──
@@ -839,45 +973,97 @@ func (s *AgentServer) loadTotalTokens(ctx context.Context, sessionID string) int
 	return 0
 }
 
-// connectMCP connects to all configured MCP servers and returns the sessions.
-// Tools are listed once at connect time and cached — the connection is
-// long-lived (one connection per session lifetime).
-// Failed connections are logged but not fatal — MCP is an optional enhancement.
-func (s *AgentServer) connectMCP(ctx context.Context, servers []openacp.McpServer) ([]*mcp.Session, []hwcloud.Tool) {
+// mcpConn is one configured MCP server's connect outcome: the live session
+// when the connect succeeded (nil otherwise). Name/Type for the wire
+// snapshot come from cfg; the outcome is just connected + a tool count.
+// Pairing them in one value replaces the former parallel
+// sessions/statuses slices, whose index alignment held only by convention
+// (statuses also carried failures).
+type mcpConn struct {
+	cfg       openacp.McpServer // merged server config; name/type source
+	sess      *mcp.Session      // nil when the connect failed
+	connected bool
+	tools     int // imported tool count (listed once at connect)
+}
+
+// mcpConns is a session's set of per-server connect outcomes, in config
+// order (failures included).
+type mcpConns []*mcpConn
+
+// statuses derives the wire snapshots pushed to the client as
+// "mcp_servers_update".
+func (conns mcpConns) statuses() []openacp.McpServerStatus {
+	out := make([]openacp.McpServerStatus, 0, len(conns))
+	for _, c := range conns {
+		st := openacp.McpServerStatus{Name: c.cfg.Name, Type: c.cfg.Type, Tools: c.tools}
+		if c.connected {
+			st.Status = "connected"
+		} else {
+			st.Status = "failed"
+		}
+		out = append(out, st)
+	}
+	return out
+}
+
+// connectMCP connects to all configured MCP servers and returns one conn
+// per server (successful or failed) plus the merged tool list. Tools are
+// listed once at connect time and cached — the connection is long-lived
+// (one connection per session lifetime). Failed connections are logged but
+// not fatal — MCP is an optional enhancement.
+func (s *AgentServer) connectMCP(ctx context.Context, servers []openacp.McpServer) (mcpConns, []hwcloud.Tool) {
 	if !s.MCPEnabled {
 		return nil, nil
 	}
+	servers = s.mergeMcpServers(servers)
 	client := mcp.NewClient(s.AgentName, s.AgentVersion)
-	var sessions []*mcp.Session
+	var conns mcpConns
 	var tools []hwcloud.Tool
 	seen := make(map[string]string) // tool name → server (duplicate detection)
 	for _, cfg := range servers {
+		conn := &mcpConn{cfg: cfg}
+		conns = append(conns, conn)
 		sess, err := s.connectOneMCP(ctx, client, cfg)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "acp: MCP connect %q failed: %v\n", cfg.Name, err)
+			mcpWarn("connect", cfg.Name, err)
 			continue
 		}
-		sessions = append(sessions, sess)
+		conn.sess = sess
+		conn.connected = true
 		// Name the session so tools are "mcp__<server>__<tool>" — unique
 		// across servers and self-describing to the model.
-		st, err := sess.Named(cfg.Name).Tools(ctx)
+		st2, err := sess.Named(cfg.Name).Tools(ctx)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "acp: MCP list tools %q failed: %v\n", cfg.Name, err)
+			mcpWarn("list tools", cfg.Name, err)
 			continue
 		}
-		for _, t := range st {
+		conn.tools = len(st2)
+		for _, t := range st2 {
 			name := t.Definition().Name
 			if owner, dup := seen[name]; dup {
 				// Two servers exposing the same tool name would make
 				// tool lookup ambiguous — skip the later one.
-				fmt.Fprintf(os.Stderr, "acp: MCP tool %q from server %q duplicates %q — skipped\n", name, cfg.Name, owner)
+				mcpWarnDup(name, cfg.Name, owner)
 				continue
 			}
 			seen[name] = cfg.Name
 			tools = append(tools, t)
 		}
 	}
-	return sessions, tools
+	return conns, tools
+}
+
+// sendMcpServersUpdate pushes the connect-time MCP snapshot to the client
+// (sidebar rendering). Sent on session create, load and resume; a nil
+// sender (stdout-free transports) skips silently.
+func (s *AgentServer) sendMcpServersUpdate(sid openacp.SessionId, conns mcpConns) {
+	if s.updateSender == nil {
+		return
+	}
+	s.updateSender.SendSessionUpdate(sid, openacp.SessionUpdate{
+		SessionUpdate: "mcp_servers_update",
+		McpServers:    conns.statuses(),
+	})
 }
 
 func (s *AgentServer) connectOneMCP(ctx context.Context, client *mcp.Client, cfg openacp.McpServer) (*mcp.Session, error) {
@@ -896,11 +1082,70 @@ func (s *AgentServer) connectOneMCP(ctx context.Context, client *mcp.Client, cfg
 	}
 }
 
-// disconnectMCP closes all MCP connections.
-func (s *AgentServer) disconnectMCP(sessions []*mcp.Session) {
-	for _, sess := range sessions {
-		_ = sess.Close()
+// mergeMcpServers merges settings-declared MCP servers with client-advertised
+// ones. Client servers win on name conflict (the client is the more specific
+// source — it knows the session's intent). Settings servers fill in the
+// global defaults the client didn't override.
+func (s *AgentServer) mergeMcpServers(client []openacp.McpServer) []openacp.McpServer {
+	s.mcpMu.RLock()
+	settings := s.settingsMcpServers
+	s.mcpMu.RUnlock()
+	if len(settings) == 0 {
+		return client
 	}
+	seen := make(map[string]bool, len(client)+len(settings))
+	merged := make([]openacp.McpServer, 0, len(client)+len(settings))
+	// Client first so it wins on conflict.
+	for _, m := range client {
+		seen[m.Name] = true
+		merged = append(merged, m)
+	}
+	for _, m := range settings {
+		if !seen[m.Name] {
+			merged = append(merged, m)
+		}
+	}
+	return merged
+}
+
+// SetSettingsMcpServers replaces the settings-declared MCP servers. Called
+// at startup and by the settings watcher on hot-reload. Safe to call
+// concurrently with session creation (mergeMcpServers takes the read lock).
+// Existing sessions keep their connected MCP tools; only new sessions pick
+// up the change.
+func (s *AgentServer) SetSettingsMcpServers(servers []openacp.McpServer) {
+	s.mcpMu.Lock()
+	s.settingsMcpServers = servers
+	s.mcpMu.Unlock()
+}
+
+// disconnectMCP closes all live MCP connections; failed conns have no
+// session to close.
+func (s *AgentServer) disconnectMCP(conns mcpConns) {
+	for _, c := range conns {
+		if c.sess != nil {
+			_ = c.sess.Close()
+		}
+	}
+}
+
+// mcpWarn logs an MCP connection/setup failure to BOTH stderr (the ACP
+// control pipe — surfaced to the client via Session.Stderr) and slog (the
+// persisted log file). A connect failure is non-fatal (connectMCP skips
+// the server and continues), but the user needs to see it in both places:
+// stderr for immediate feedback in the client, slog for post-mortem in the
+// server log.
+func mcpWarn(op, name string, err error) {
+	msg := fmt.Sprintf("acp: MCP %s %q failed: %v", op, name, err)
+	fmt.Fprintln(os.Stderr, msg)
+	slog.Warn("mcp setup failed", "op", op, "server", name, "error", err)
+}
+
+// mcpWarnDup logs a duplicate tool-name skip (same dual-write rationale).
+func mcpWarnDup(tool, server, owner string) {
+	msg := fmt.Sprintf("acp: MCP tool %q from server %q duplicates %q — skipped", tool, server, owner)
+	fmt.Fprintln(os.Stderr, msg)
+	slog.Warn("mcp tool duplicate skipped", "tool", tool, "server", server, "owner", owner)
 }
 
 func (s *AgentServer) putSession(id openacp.SessionId, ss *agentSession) {
@@ -985,7 +1230,7 @@ func (s *AgentServer) resolveSessionCwd(ctx context.Context, sessionID, reqCwd s
 
 func (s *AgentServer) OnNewSession(ctx context.Context, req openacp.NewSessionRequest) (*openacp.NewSessionResponse, error) {
 	id := s.newSessionID()
-	mcpSessions, mcpTools := s.connectMCP(ctx, req.McpServers)
+	mcpConns, mcpTools := s.connectMCP(ctx, req.McpServers)
 	cwd := utils.NormalizePath(req.Cwd)
 	ss := &agentSession{
 		id:                    id,
@@ -996,7 +1241,7 @@ func (s *AgentServer) OnNewSession(ctx context.Context, req openacp.NewSessionRe
 		firstPrompt:           true,
 		additionalDirectories: req.AdditionalDirectories,
 		mcpServers:            req.McpServers,
-		mcpSessions:           mcpSessions,
+		mcpConns:              mcpConns,
 		mcpTools:              mcpTools,
 	}
 
@@ -1012,15 +1257,21 @@ func (s *AgentServer) OnNewSession(ctx context.Context, req openacp.NewSessionRe
 	s.putSession(id, ss)
 	s.saveMeta(ctx, string(id), cwd, "acp", req.Meta)
 
-	// Send available commands so the client can show them immediately.
+	// Send available commands and skills so the client can show them immediately.
 	if s.updateSender != nil {
 		s.updateSender.SendSessionUpdate(id, openacp.SessionUpdate{
 			SessionUpdate:     "available_commands_update",
 			AvailableCommands: s.availableCommands(),
 		})
+		s.updateSender.SendSessionUpdate(id, openacp.SessionUpdate{
+			SessionUpdate:   "available_skills_update",
+			AvailableSkills: s.availableSkills(ss),
+		})
 	}
+	s.sendMcpServersUpdate(id, mcpConns)
 
 	return &openacp.NewSessionResponse{
+		Meta:          map[string]any{"created_at": time.Now().UTC().Format(time.RFC3339Nano)},
 		SessionID:     id,
 		ConfigOptions: s.buildConfigOptions(id),
 		Modes:         s.buildModeState(id),
@@ -1050,7 +1301,8 @@ func (s *AgentServer) OnLoadSession(ctx context.Context, req openacp.LoadSession
 			mcpServers:            req.McpServers,
 		}
 		// Reconnect MCP servers and inject tools for this session.
-		ss.mcpSessions, ss.mcpTools = s.connectMCP(ctx, req.McpServers)
+		ss.mcpConns, ss.mcpTools = s.connectMCP(ctx, req.McpServers)
+		s.sendMcpServersUpdate(req.SessionID, ss.mcpConns)
 
 		// Create per-session process manager for long-running shell commands.
 		if cwd != "" {
@@ -1078,15 +1330,27 @@ func (s *AgentServer) OnLoadSession(ctx context.Context, req openacp.LoadSession
 		s.replayPlan(sender, entries)
 	}
 
-	// Send available commands (same as session/new).
+	// Send available commands and skills (same as session/new).
 	if s.updateSender != nil {
 		s.updateSender.SendSessionUpdate(req.SessionID, openacp.SessionUpdate{
 			SessionUpdate:     "available_commands_update",
 			AvailableCommands: s.availableCommands(),
 		})
+		s.updateSender.SendSessionUpdate(req.SessionID, openacp.SessionUpdate{
+			SessionUpdate:   "available_skills_update",
+			AvailableSkills: s.availableSkills(ss),
+		})
+	}
+
+	// Carry created_at in _meta so the frontend can display the session's
+	// creation time on load (not just on live creation).
+	meta := map[string]any{}
+	if !ss.createdAt.IsZero() {
+		meta["created_at"] = ss.createdAt.UTC().Format(time.RFC3339Nano)
 	}
 
 	return &openacp.LoadSessionResponse{
+		Meta:          meta,
 		ConfigOptions: s.buildConfigOptions(req.SessionID),
 		Modes:         s.buildModeState(req.SessionID),
 	}, nil
@@ -1122,6 +1386,14 @@ func (s *AgentServer) replayHistory(ctx context.Context, sid openacp.SessionId, 
 		}
 		switch msg.Role {
 		case hwcloud.RoleUser:
+			// Skip <system-reminder> messages on replay — they are injected
+			// environment events (sub-agent completion notifications), not
+			// user speech. Rendering them as user_message_chunk would show
+			// raw <system-reminder> XML in the chat history on session load.
+			trimmed := strings.TrimSpace(msg.Content)
+			if strings.HasPrefix(trimmed, "<system-reminder>") && strings.HasSuffix(trimmed, "</system-reminder>") {
+				continue
+			}
 			sender.SendHistoryMessageWithMeta("user_message_chunk", msg.Content, mid, meta)
 
 		case hwcloud.RoleAssistant:
@@ -1206,7 +1478,8 @@ func (s *AgentServer) OnResumeSession(ctx context.Context, req openacp.ResumeSes
 			mcpServers:            req.McpServers,
 		}
 		// Reconnect MCP servers and inject tools for this session.
-		ss.mcpSessions, ss.mcpTools = s.connectMCP(ctx, req.McpServers)
+		ss.mcpConns, ss.mcpTools = s.connectMCP(ctx, req.McpServers)
+		s.sendMcpServersUpdate(req.SessionID, ss.mcpConns)
 
 		// Create per-session process manager for shell tool background processes.
 		if cwd != "" {
@@ -1235,7 +1508,8 @@ func (s *AgentServer) OnResumeSession(ctx context.Context, req openacp.ResumeSes
 func (s *AgentServer) OnCloseSession(ctx context.Context, req openacp.CloseSessionRequest) (*openacp.CloseSessionResponse, error) {
 	ss := s.getSession(req.SessionID)
 	if ss != nil {
-		s.disconnectMCP(ss.mcpSessions)
+		s.disconnectMCP(ss.mcpConns)
+		s.killSubAgents(ss)
 	}
 	s.removeSession(req.SessionID)
 	return &openacp.CloseSessionResponse{}, nil
@@ -1244,7 +1518,8 @@ func (s *AgentServer) OnCloseSession(ctx context.Context, req openacp.CloseSessi
 func (s *AgentServer) OnDeleteSession(ctx context.Context, req openacp.DeleteSessionRequest) (*openacp.DeleteSessionResponse, error) {
 	ss := s.getSession(req.SessionID)
 	if ss != nil {
-		s.disconnectMCP(ss.mcpSessions)
+		s.disconnectMCP(ss.mcpConns)
+		s.killSubAgents(ss)
 		if ss.processMgr != nil {
 			ss.processMgr.Cleanup()
 		}
@@ -1279,13 +1554,68 @@ func (s *AgentServer) OnListSessions(ctx context.Context, req openacp.ListSessio
 	return &openacp.ListSessionsResponse{Sessions: out}, nil
 }
 
+// OnListMessages returns a session's stored messages (oldest first) without
+// loading or resuming the session — a paginated window over the same
+// SessionStore the load-replay reads, mirroring REST /sessions/{id}/messages.
+// nil memory (--memory=off) or an unknown session yields an empty list.
+func (s *AgentServer) OnListMessages(ctx context.Context, req openacp.ListMessagesRequest) (*openacp.ListMessagesResponse, error) {
+	if s.Mem == nil {
+		return &openacp.ListMessagesResponse{Messages: []openacp.Message{}}, nil
+	}
+	limit := req.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	before := max(0, req.Before)
+
+	msgs, err := s.Mem.Recent(ctx, string(req.SessionID), limit, before)
+	if err != nil {
+		return nil, fmt.Errorf("list messages: %w", err)
+	}
+	out := make([]openacp.Message, 0, len(msgs))
+	for _, m := range msgs {
+		item := openacp.Message{
+			Role:             string(m.Role),
+			Content:          m.Content,
+			ReasoningContent: m.ReasoningContent,
+			ToolCallID:       m.ToolCallID,
+		}
+		for _, tc := range m.ToolCalls {
+			item.ToolCalls = append(item.ToolCalls, openacp.ToolCallRef{
+				ID: tc.ID, Name: tc.Function.Name, Args: tc.Function.Arguments,
+			})
+		}
+		if m.CreatedAt != nil {
+			item.CreatedAt = m.CreatedAt.UTC().Format(time.RFC3339Nano)
+		}
+		out = append(out, item)
+	}
+	return &openacp.ListMessagesResponse{Messages: out}, nil
+}
+
 // ── Config & modes ──
+
+// OnListConfigOptions returns the config options a fresh session would
+// receive (mode, thought level, model selector), without creating one:
+// session/list_config_options. buildConfigOptions already degrades to
+// defaults when the session is unknown, so an empty id yields the
+// "what you would get" snapshot.
+func (s *AgentServer) OnListConfigOptions(ctx context.Context, req openacp.ListConfigOptionsRequest) (*openacp.ListConfigOptionsResponse, error) {
+	return &openacp.ListConfigOptionsResponse{ConfigOptions: s.buildConfigOptions("")}, nil
+}
 
 func (s *AgentServer) buildConfigOptions(sid openacp.SessionId) []openacp.SessionConfigOption {
 	ss := s.getSession(sid)
-	mode := "auto"
+	// The session-less shape (list_config_options at boot) must advertise the
+	// server's real default — hardcoding "auto" here desynced the cold-start
+	// mode picker: the client believed auto was already selected, so picking
+	// auto hit the no-change early return and the first switch did nothing.
+	mode := s.defaultMode()
 	thoughtLevel := "medium"
-	modelID := s.getDefaultModelID()
+	modelID := s.GetDefaultModelID()
 	if ss != nil {
 		mode = ss.Mode()
 		if val, ok := ss.ConfigString("thought_level"); ok {
@@ -1305,7 +1635,8 @@ func (s *AgentServer) buildConfigOptions(sid openacp.SessionId) []openacp.Sessio
 			Type:         "select",
 			CurrentValue: mode,
 			Options: []openacp.SessionConfigOptValue{
-				{Value: "auto", Name: "Auto", Description: "Fully automated processing (HIGH RISK), AI will NOT seek your approval"},
+				{Value: "auto", Name: "Auto", Description: "Fully automated, AI will NOT seek your approval for any operations (including destructive)"},
+				{Value: "semi-auto", Name: "Semi-Auto", Description: "AI auto-executes safe operations, but seeks your approval for destructive operations"},
 				{Value: "manual", Name: "Manual", Description: "Your approval is required for AI to perform NONE-READ-ONLY operations"},
 				{Value: "plan", Name: "Plan", Description: "Present the plan first, AI will execute it according to the plan"},
 			},
@@ -1326,7 +1657,7 @@ func (s *AgentServer) buildConfigOptions(sid openacp.SessionId) []openacp.Sessio
 	}
 
 	// Model selector.
-	if ids := s.modelIDs(); len(ids) > 0 {
+	if ids := s.ModelIDs(); len(ids) > 0 {
 		modelOpts := make([]openacp.SessionConfigOptValue, 0, len(ids))
 		for _, id := range ids {
 			modelOpts = append(modelOpts, openacp.SessionConfigOptValue{Value: id, Name: id})
@@ -1354,10 +1685,33 @@ func (s *AgentServer) buildModeState(sid openacp.SessionId) *openacp.SessionMode
 	return &openacp.SessionModeState{
 		CurrentModeID: openacp.SessionModeId(current),
 		AvailableModes: []openacp.SessionMode{
-			{ID: "auto", Name: "Auto", Description: "Fully automated processing (HIGH RISK), AI will NOT seek your approval"},
+			{ID: "auto", Name: "Auto", Description: "Fully automated, AI will NOT seek your approval for any operation (including destructive)"},
+			{ID: "semi-auto", Name: "Semi-Auto", Description: "AI auto-executes safe operations, but seeks your approval for destructive (risk_note) commands"},
 			{ID: "manual", Name: "Manual", Description: "Your approval is required for AI to perform NONE-READ-ONLY operations"},
 			{ID: "plan", Name: "Plan", Description: "Present the plan first, AI will execute it according to the plan"},
 		},
+	}
+}
+
+// BroadcastConfigOptions sends a config_option_update to every active
+// session so the frontend picks up model list changes (e.g. after a
+// settings reload added/removed models via SetModel). Sessions without
+// an updateSender (CLI one-shot) are skipped.
+func (s *AgentServer) BroadcastConfigOptions() {
+	if s.updateSender == nil {
+		return
+	}
+	s.mu.Lock()
+	ids := make([]openacp.SessionId, 0, len(s.sessions))
+	for sid := range s.sessions {
+		ids = append(ids, sid)
+	}
+	s.mu.Unlock()
+	for _, sid := range ids {
+		s.updateSender.SendSessionUpdate(sid, openacp.SessionUpdate{
+			SessionUpdate: "config_option_update",
+			ConfigOptions: s.buildConfigOptions(sid),
+		})
 	}
 }
 
@@ -1374,6 +1728,78 @@ func (s *AgentServer) availableCommands() []openacp.AvailableCommand {
 			ac.Input = &openacp.AvailableCommandInput{Hint: c.Input.Hint}
 		}
 		out[i] = ac
+	}
+	return out
+}
+
+// buildSessionSkillProvider creates a skill provider scoped to the session's
+// cwd. Project-level skills resolve from <cwd>/.agents/skills instead of the
+// server process's cwd. Global (~/.agents/skills) and builtin (embed) sources
+// are unaffected by cwd.
+func (s *AgentServer) buildSessionSkillProvider(cwd string) skill.Provider {
+	var roots []fs.RootEntry
+	// Always register this root (do NOT os.Stat it at session-creation
+	// time). The directory may not exist yet — the user may install a
+	// skill later via npx/CLI, which creates <cwd>/.agents/skills. If we
+	// skip the root when the dir is absent at creation, reload_skills
+	// (which calls Discover on the already-built roots) will never scan
+	// the new directory. Discover handles a missing directory gracefully
+	// (returns no skills from that root).
+
+	// global: ~/.agents/skills
+	if home, err := os.UserHomeDir(); err == nil {
+		d := filepath.Join(home, ".agents", "skills")
+		roots = append(roots, fs.RootEntry{Path: d, Type: "global"})
+	}
+	// project: <session-cwd>/.agents/skills
+	if cwd != "" {
+		d := filepath.Join(cwd, ".agents", "skills")
+		roots = append(roots, fs.RootEntry{Path: d, Type: "project"})
+	}
+	embedFS := builtinskills.BuiltinFS()
+	if len(roots) == 0 && embedFS == nil {
+		return s.Deps.SkillProvider // fallback to server-level provider
+	}
+	loader := fs.NewWithSources(roots...)
+	if embedFS != nil {
+		loader = loader.WithEmbedFS(embedFS)
+	}
+	return skill.NewFSBridge(loader)
+}
+
+// availableSkills returns the skill catalog for the client to render a
+// skill panel or @skill autocomplete. Discovers from the session's
+// SkillProvider (per-session cwd) when available, falling back to the
+// server-level provider.
+func (s *AgentServer) availableSkills(ss *agentSession) []openacp.AvailableSkill {
+	var sp skill.Provider
+	if rt := ss.getRuntime(); rt != nil {
+		sp = rt.SkillProvider()
+	}
+	if sp == nil {
+		sp = s.Deps.SkillProvider
+	}
+	if sp == nil {
+		return nil
+	}
+	skills, err := sp.Discover(context.Background())
+	if err != nil || len(skills) == 0 {
+		return nil
+	}
+	out := make([]openacp.AvailableSkill, len(skills))
+	for i, sk := range skills {
+		// Builtin skills have no disk path; leave Path empty so the
+		// frontend can distinguish by Type alone.
+		path := sk.Path
+		if sk.Type == "builtin" {
+			path = ""
+		}
+		out[i] = openacp.AvailableSkill{
+			Name:        sk.Name,
+			Description: sk.Description,
+			Path:        path,
+			Type:        sk.Type,
+		}
 	}
 	return out
 }
@@ -1487,7 +1913,7 @@ func (s *AgentServer) OnSetSessionConfigOption(ctx context.Context, req openacp.
 		switch req.ConfigID {
 		case "model":
 			if v, ok := ss.ConfigString("model"); ok {
-				if m, ok := s.lookupModel(v); ok {
+				if m, ok := s.LookupModel(v); ok {
 					s.switchSessionModel(ss, m)
 				} else {
 					// The requested model is not in the provider list —
@@ -1564,11 +1990,22 @@ func (s *AgentServer) OnPrompt(ctx context.Context, req openacp.PromptRequest, s
 	// ── Auto-title from first user message ──
 	if ss.firstPrompt {
 		ss.firstPrompt = false
-		title := firstLine(input.Content, 80)
-		s.updateTitle(ctx, req.SessionID, title)
-
-		sender.SendSessionInfo(title, nil)
+		// Generate a concise title via LLM — it picks the right language
+		// (matching the user's) and a short descriptive label, no truncation.
+		// Falls back to firstLine if the model call fails or times out.
+		// Uses a temporary title immediately so the UI isn't blank while
+		// the LLM call runs; updates to the real title when it returns.
+		fallback := firstLine(input.Content, 80)
+		s.updateTitle(ctx, req.SessionID, fallback)
+		sender.SendSessionInfo(fallback, nil)
 		sender.SendAvailableCommands(s.availableCommands())
+
+		// Async LLM title generation — don't block the turn for it.
+		if m := s.resolveSessionModel(ss); m != nil {
+			go s.generateTitle(req.SessionID, m, input.Content, fallback)
+		} else {
+			slog.Warn("title generation skipped: no model resolved", "session", req.SessionID)
+		}
 	}
 
 	// ── Session-scoped Runtime, reused across turns ──
@@ -1580,6 +2017,12 @@ func (s *AgentServer) OnPrompt(ctx context.Context, req openacp.PromptRequest, s
 		agent = s.buildRuntimeForSession(req.SessionID, ss)
 		ss.setRuntime(agent)
 	}
+
+	// Push the skill catalog every turn so the frontend skill panel stays
+	// in sync with disk changes without requiring the model to call
+	// reload_skills. The data is small (name+description+path+type per
+	// skill) and Discover is a light directory scan.
+	sender.SendAvailableSkills(s.availableSkills(ss))
 
 	providerID, modelID := s.resolveModelConfig(ss)
 	oaSession := hwcloud.Session{
@@ -1600,6 +2043,7 @@ func (s *AgentServer) OnPrompt(ctx context.Context, req openacp.PromptRequest, s
 			"cwd":                   ss.cwd,
 			"additionalDirectories": ss.additionalDirectories,
 			"mcpServers":            ss.mcpServers,
+			"mode":                  ss.Mode(),
 		},
 		DynamicContext: s.buildDynamicContext(ss),
 	}
@@ -1624,6 +2068,7 @@ func (s *AgentServer) OnPrompt(ctx context.Context, req openacp.PromptRequest, s
 	ch := agent.RunStream(ctx, oaSession, input)
 	var usage hwcloud.Usage
 	var stopReason openacp.StopReason
+	turnCount := 0
 
 	for evt := range ch {
 		switch evt.Type {
@@ -1671,14 +2116,74 @@ func (s *AgentServer) OnPrompt(ctx context.Context, req openacp.PromptRequest, s
 			})
 
 		case hwcloud.StreamRetrying:
-			if evt.Error != nil {
-				sender.SendAgentThought(fmt.Sprintf("[retrying: %v]", evt.Error))
+			// "model_retrying" — a transient model error triggered a retry.
+			// Sent as a custom session/update subtype (same pattern as
+			// context_compacting) so clients can show retry status without
+			// polluting the agent_thought_chunk stream.
+			if evt.Retry != nil && s.updateSender != nil {
+				s.updateSender.SendSessionUpdate(req.SessionID, openacp.SessionUpdate{
+					SessionUpdate: "model_retrying",
+					Meta: map[string]any{
+						"model":           evt.Retry.Model,
+						"attempt":         evt.Retry.Attempt,
+						"max_retries":     evt.Retry.MaxRetries,
+						"backoff_seconds": evt.Retry.BackoffSeconds,
+						"error":           evt.Retry.Error.Error(),
+					},
+				})
+			}
+		case hwcloud.StreamSkillsUpdated:
+			// reload_skills discovered a new skill set (install/uninstall
+			// on disk). Push the updated catalog to the client so the
+			// frontend skill panel refreshes in real time.
+			skills := make([]openacp.AvailableSkill, len(evt.Skills))
+			for i, sk := range evt.Skills {
+				path := sk.Path
+				if sk.Type == "builtin" {
+					path = ""
+				}
+				skills[i] = openacp.AvailableSkill{
+					Name:        sk.Name,
+					Description: sk.Description,
+					Path:        path,
+					Type:        sk.Type,
+				}
+			}
+			sender.SendAvailableSkills(skills)
+
+		case hwcloud.StreamCompacting:
+			// "context_compacting" — compaction started, client shows a status.
+			if evt.Compaction != nil && s.updateSender != nil {
+				s.updateSender.SendSessionUpdate(req.SessionID, openacp.SessionUpdate{
+					SessionUpdate: "context_compacting",
+					Meta: map[string]any{
+						"overflow_tokens": evt.Compaction.OverflowTokens,
+						"total_messages":  evt.Compaction.TotalMessages,
+					},
+				})
+			}
+
+		case hwcloud.StreamCompacted:
+			// "context_compacted" — compaction finished, client updates usage.
+			if evt.Compaction != nil && s.updateSender != nil {
+				s.updateSender.SendSessionUpdate(req.SessionID, openacp.SessionUpdate{
+					SessionUpdate: "context_compacted",
+					Meta: map[string]any{
+						"compressed_messages": evt.Compaction.CompressedMessages,
+						"freed_tokens":        evt.Compaction.FreedTokens,
+						"error":               evt.Compaction.Error,
+					},
+				})
 			}
 
 		case hwcloud.StreamDone:
 			if evt.Result != nil {
 				usage = evt.Result.Usage
 				stopReason = finishReasonToACP(evt.Result.StopReason)
+				// Kernel loop iterations for this prompt: model↔tool round
+				// trips. Surfaced in the response _meta so the client can
+				// show per-turn step counts.
+				turnCount = evt.Result.TurnCount
 			}
 
 		case hwcloud.StreamError:
@@ -1718,7 +2223,10 @@ func (s *AgentServer) OnPrompt(ctx context.Context, req openacp.PromptRequest, s
 	if stopReason == "" {
 		stopReason = openacp.StopReasonEndTurn
 	}
-	return &openacp.PromptResponse{StopReason: stopReason, Meta: map[string]any{"mode": ss.Mode()}}, nil
+	return &openacp.PromptResponse{StopReason: stopReason, Meta: map[string]any{
+		"mode":       ss.Mode(),
+		"turn_count": turnCount,
+	}}, nil
 }
 
 // ── Content block conversion ──
@@ -1825,6 +2333,61 @@ func (s *AgentServer) updateTitle(ctx context.Context, sessionID openacp.Session
 	}
 }
 
+// generateTitle calls the LLM to produce a concise session title from the
+// first user message. It runs in a goroutine with a 1-minute timeout; on
+// success it updates the session title and pushes sessionInfo to all
+// subscribers. On failure or timeout it keeps the fallback title. The LLM
+// picks the right language (matching the user's) and a short label — no
+// truncation needed.
+func (s *AgentServer) generateTitle(sid openacp.SessionId, model hwcloud.Model, userMessage, fallback string) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	slog.Info("title generation started", "session", sid, "fallback", fallback)
+	resp, err := model.ChatCompletion(ctx, hwcloud.ChatCompletionRequest{
+		Messages: []hwcloud.Message{
+			{Role: hwcloud.RoleSystem, Content: "You are a conversation title generator. " +
+				"A user has just started a new chat session. Below is their first message. " +
+				"Generate a concise title (2-10 words) that captures the topic or theme of this conversation. " +
+				"The title should reflect what the user wants to discuss, not answer their message. " +
+				"Use the same language as the user's message. " +
+				"Output ONLY the title — no quotes, no explanation, no trailing punctuation."},
+			{Role: hwcloud.RoleUser, Content: userMessage},
+		},
+	})
+	if err != nil {
+		slog.Warn("title generation failed", "session", sid, "error", err)
+		return
+	}
+	if len(resp.Choices) == 0 {
+		slog.Warn("title generation no choices", "session", sid, "usage", resp.Usage)
+		return
+	}
+	content := resp.Choices[0].Message.Content
+	if content == "" {
+		slog.Warn("title generation empty content", "session", sid, "finish_reason", resp.Choices[0].FinishReason, "usage", resp.Usage)
+		return
+	}
+	title := strings.TrimSpace(content)
+	// Strip quotes if the model wrapped the title in them.
+	title = strings.Trim(title, `"'`)
+	if title == "" || title == fallback {
+		return
+	}
+	slog.Info("title generation success", "session", sid, "title", title)
+
+	// Update the persisted title and notify subscribers.
+	updateCtx, updateCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer updateCancel()
+	s.renameSession(updateCtx, sid, title)
+	if s.updateSender != nil {
+		s.updateSender.SendSessionUpdate(sid, openacp.SessionUpdate{
+			SessionUpdate: "session_info_update",
+			Title:         &title,
+		})
+	}
+}
+
 // buildRuntimeForSession builds the session-scoped Runtime once, at session
 // creation or load. It carries the permanent tool set (execution tools for
 // auto/manual, read-only tools for plan) plus the session's model, prompts,
@@ -1838,29 +2401,39 @@ func (s *AgentServer) buildRuntimeForSession(sid openacp.SessionId, ss *agentSes
 	deps.HumanApprover = nil
 	// Session-mode tools are excluded from sub-agent tool sets: their
 	// callbacks are session-bound and would be nil in the child runtime.
+	// settings is excluded too — settings.json is global config (may carry
+	// apikeys and other secrets); only the parent agent (in direct contact
+	// with the user) should read or modify it, never a delegated sub-agent.
 	deps.SubAgentExcludeTools = []string{
 		"plan_create", "plan_update",
 		"enter_plan_mode", "exit_plan_mode",
+		"settings",
 	}
 	// Share the server-level persisted approval memory so the policy
 	// chain's Memory layer recalls "always allow" decisions across turns
 	// (written by acpApprover.always into the same instance).
 	deps.ApprovalMemory = s.approvalMemory
 
+	// Build a per-session skill provider so project-level skills
+	// (<cwd>/.agents/skills) resolve against the session's working
+	// directory, not the server process's cwd. Global and builtin
+	// sources are unaffected by cwd.
+	deps.SkillProvider = s.buildSessionSkillProvider(ss.cwd)
+
 	// Resolve model from the session config registry.
-	modelID := s.getDefaultModelID()
+	modelID := s.GetDefaultModelID()
 	if val, ok := ss.ConfigString("model"); ok {
 		modelID = val
 	}
-	if m, ok := s.lookupModel(modelID); ok {
+	if m, ok := s.LookupModel(modelID); ok {
 		cfg.Model = m
-	} else if m, ok := s.lookupModel(s.getDefaultModelID()); ok {
+	} else if m, ok := s.LookupModel(s.GetDefaultModelID()); ok {
 		// The session's saved model is no longer in the provider list
 		// (removed/renamed after the session was saved) — fall back to the
 		// default instead of leaving cfg.Model nil, which would make a
 		// restored session fail every turn with "no model configured".
-		if v, _ := ss.ConfigString("model"); v != "" && v != s.getDefaultModelID() {
-			slog.Warn("session model not in provider list, falling back to default", "session", sid, "model", v, "default", s.getDefaultModelID())
+		if v, _ := ss.ConfigString("model"); v != "" && v != s.GetDefaultModelID() {
+			slog.Warn("session model not in provider list, falling back to default", "session", sid, "model", v, "default", s.GetDefaultModelID())
 		}
 		cfg.Model = m
 	}
@@ -1897,6 +2470,16 @@ func (s *AgentServer) buildRuntimeForSession(sid openacp.SessionId, ss *agentSes
 			}
 		}
 		ss.setSubAgentTools(cached)
+		// Wire async sub-agent completion: when a background sub-agent
+		// finishes, trigger an idle turn via the SDK mux's TriggerTurn
+		// (fully serialized with user turns via sessionLocks). The note
+		// becomes the prompt input so the model processes the result
+		// immediately, not "whenever the user comes back".
+		if reg := rt.SubAgentRegistry(); reg != nil {
+			reg.SetOnExit(func(note string) {
+				s.triggerIdleTurn(sid, note)
+			})
+		}
 	}
 
 	// Initial mode tool set + approver.
@@ -1959,20 +2542,21 @@ func (s *AgentServer) applyModeTools(sid openacp.SessionId, ss *agentSession, rt
 		rt.SetHumanApprover(nil)
 
 	default:
-		// Auto/manual: full tool set. Auto has no approval prompts (safety
-		// is handled by Guard.in/Guard.out if configured); manual routes
-		// EVERY tool call through the ACP approver — including read-only
-		// tools (no Safety layer, so nothing auto-approves). "Always allow"
-		// decisions still shortcut through the approval memory; handoffs
-		// stay free.
+		// Auto/semi-auto/manual: full tool set. All three route through the
+		// ACP approver — the mode difference is enforced INSIDE acpApprover.Ask:
+		//   auto      — allow everything (no prompts, incl. risk_note)
+		//   semi-auto — allow safe calls, prompt for risk_note (destructive)
+		//   manual    — prompt for every call (incl. read-only)
+		// "Always allow" decisions still shortcut through the approval memory;
+		// handoffs stay free.
 		if s.clientRPC != nil && s.clientCanReadFile() {
 			add = append(add, opentool.NewACPReadFile(s.clientRPC, sid))
 		}
 		add = append(add, s.executionTools(sid, ss)...)
 		add = append(add, ss.subAgentTools...)
 
-		if ss.mode == "manual" && s.clientRPC != nil {
-			rt.SetHumanApprover(&acpApprover{client: s.clientRPC, sessionID: sid, memory: s.approvalMemory})
+		if s.clientRPC != nil {
+			rt.SetHumanApprover(&acpApprover{client: s.clientRPC, sessionID: sid, memory: s.approvalMemory, modeFn: ss.Mode})
 		} else {
 			rt.SetHumanApprover(nil)
 		}
@@ -1992,11 +2576,18 @@ func toolNames(tools []hwcloud.Tool) []string {
 }
 
 // subAgentToolNames returns the delegation tool names for a config's
-// sub-agents (registered as tools by kernel.New).
+// sub-agents (registered as tools by kernel.New), plus "sub_agent_send" and
+// "sub_agent_list" when delegation tools exist — the follow-up/status tools
+// are registered alongside them (kernel.New) and must be cached/dropped/
+// re-injected in lockstep with them across plan-mode transitions
+// (applyModeTools).
 func subAgentToolNames(cfg *agent.Agent) []string {
 	var names []string
 	for _, sa := range cfg.SubAgents {
 		names = append(names, sa.Name)
+	}
+	if len(cfg.SubAgents) > 0 {
+		names = append(names, "sub_agent_send", "sub_agent_list")
 	}
 	return names
 }
@@ -2276,7 +2867,7 @@ func (s *AgentServer) buildSlashContext(ctx context.Context, sid openacp.Session
 			return out, nil
 		},
 		SetModel: func(modelID string) error {
-			m, ok := s.lookupModel(modelID)
+			m, ok := s.LookupModel(modelID)
 			if !ok {
 				return fmt.Errorf("unknown model: %s", modelID)
 			}
@@ -2293,7 +2884,7 @@ func (s *AgentServer) buildSlashContext(ctx context.Context, sid openacp.Session
 			return nil
 		},
 		ListModels: func() []string {
-			return s.modelIDs()
+			return s.ModelIDs()
 		},
 		// Both callbacks touch the session runtime, which is built lazily
 		// on the first prompt (slash dispatch runs BEFORE that build). Build
@@ -2304,12 +2895,36 @@ func (s *AgentServer) buildSlashContext(ctx context.Context, sid openacp.Session
 				rt = s.buildRuntimeForSession(sid, ss)
 				ss.setRuntime(rt)
 			}
+			// Notify the client that compaction is starting.
+			if s.updateSender != nil {
+				s.updateSender.SendSessionUpdate(sid, openacp.SessionUpdate{
+					SessionUpdate: "context_compacting",
+					Meta:          map[string]any{},
+				})
+			}
 			st, err := rt.CompressAll(ctx, string(sid))
 			if err != nil {
+				// Notify the client that compaction failed.
+				if s.updateSender != nil {
+					s.updateSender.SendSessionUpdate(sid, openacp.SessionUpdate{
+						SessionUpdate: "context_compacted",
+						Meta:          map[string]any{"error": err.Error()},
+					})
+				}
 				return nil, err
 			}
 			if st == nil {
 				return &slash.CompactStats{}, nil // no compressor configured
+			}
+			// Notify the client that compaction finished.
+			if s.updateSender != nil {
+				s.updateSender.SendSessionUpdate(sid, openacp.SessionUpdate{
+					SessionUpdate: "context_compacted",
+					Meta: map[string]any{
+						"compressed_messages": st.Compressed,
+						"freed_tokens":        st.FreedTokens,
+					},
+				})
 			}
 			return &slash.CompactStats{
 				Compressed:    st.Compressed,
@@ -2317,21 +2932,51 @@ func (s *AgentServer) buildSlashContext(ctx context.Context, sid openacp.Session
 				SummaryTokens: st.SummaryTokens,
 			}, nil
 		},
-		ContextStats: func() (*slash.ContextStats, error) {
-			rt := ss.getRuntime()
-			if rt == nil {
-				rt = s.buildRuntimeForSession(sid, ss)
-				ss.setRuntime(rt)
+		SettingsList: func() (string, error) {
+			s.settingsCBMu.RLock()
+			cb := s.settingsCB
+			s.settingsCBMu.RUnlock()
+			if cb.List == nil {
+				return "", fmt.Errorf("settings unavailable (no server running)")
 			}
-			summary, working, window, err := rt.ContextUsage(ctx, string(sid))
-			if err != nil {
-				return nil, err
+			return cb.List()
+		},
+		SettingsGet: func(key string) (string, error) {
+			s.settingsCBMu.RLock()
+			cb := s.settingsCB
+			s.settingsCBMu.RUnlock()
+			if cb.Get == nil {
+				return "", fmt.Errorf("settings unavailable (no server running)")
 			}
-			return &slash.ContextStats{
-				SummaryTokens: summary,
-				WorkingTokens: working,
-				Window:        window,
-			}, nil
+			return cb.Get(key)
+		},
+		SettingsSet: func(key, value string) error {
+			s.settingsCBMu.RLock()
+			cb := s.settingsCB
+			s.settingsCBMu.RUnlock()
+			if cb.Set == nil {
+				return fmt.Errorf("settings unavailable (no server running)")
+			}
+			return cb.Set(key, value)
+		},
+		SettingsValidate: func() (warnings, violations []string, err error) {
+			s.settingsCBMu.RLock()
+			cb := s.settingsCB
+			s.settingsCBMu.RUnlock()
+			if cb.Validate == nil {
+				return nil, nil, fmt.Errorf("settings unavailable (no server running)")
+			}
+			return cb.Validate()
+		},
+		SettingsReload: func() (applied, violations []string, parseError string) {
+			s.settingsCBMu.RLock()
+			cb := s.settingsCB
+			s.settingsCBMu.RUnlock()
+			if cb.Reload == nil {
+				return nil, nil, "no server running (reload is only available when a server is live)"
+			}
+			result := cb.Reload(ctx)
+			return result.Applied, result.Violations, result.ParseError
 		},
 	}
 }
@@ -2362,6 +3007,7 @@ type acpApprover struct {
 	client    openacp.ClientRequester
 	sessionID openacp.SessionId
 	memory    governance.ApprovalMemory // session-scoped "allow always" persistence
+	modeFn    func() string             // returns the session's current mode (live, not a snapshot)
 }
 
 // Ask implements governance.HumanApprover. The ACP permission response
@@ -2373,8 +3019,69 @@ func (a *acpApprover) Ask(ctx context.Context, call hwcloud.ToolCall, def hwclou
 		// allowed — an unapprovable call should never auto-execute.
 		return governance.Decision{Action: governance.Deny, Reason: "no approval client configured"}, nil
 	}
+
+	// Mode-driven auto-allow. The policy engine's risk-note bypass already
+	// routed risk_note calls here via askHuman; the mode decides what happens:
+	//
+	//   auto      — true fully-automatic: allow EVERYTHING, including
+	//               risk_note (destructive) calls. No approval prompts ever.
+	//   semi-auto — allow calls WITHOUT a risk_note; risk_note calls fall
+	//               through to the approval prompt (the old "auto" behavior).
+	//   manual    — everything prompts (no auto-allow branch; falls through).
+	mode := ""
+	if a.modeFn != nil {
+		mode = a.modeFn()
+	}
+	if mode == "auto" {
+		// Fully automatic — no approval for any call, risk_note or not.
+		return governance.Decision{Action: governance.Allow, Reason: "auto mode"}, nil
+	}
+
+	// Fall through to the approval prompt: manual mode (everything prompts),
+	// semi-auto + risk_note, or unknown mode (fail toward asking).
+	var meta map[string]any
+	var params struct {
+		RiskNote string `json:"risk_note"`
+	}
+	hasRisk := json.Unmarshal([]byte(call.Function.Arguments), &params) == nil && strings.TrimSpace(params.RiskNote) != ""
+	if hasRisk {
+		meta = map[string]any{"_risk_note": params.RiskNote}
+	}
+
+	if mode == "semi-auto" && !hasRisk {
+		// Semi-auto: auto-allow safe calls; risk_note calls prompt.
+		return governance.Decision{Action: governance.Allow, Reason: "semi-auto mode"}, nil
+	}
+
+	// ACP semantics: allow_once = this call only (never remembered),
+	// allow_always = remembered for the session. For shell, the grant
+	// covers the command's atoms and file accesses (all of them must
+	// be remembered to skip approval — see governance.MemoryKeys), so
+	// a changed command or a new file target re-asks while reused
+	// ones don't. Cross-session rules are a separate configuration
+	// layer, not a button grant.
+	//
+	// High-risk (risk_note) calls get only Allow once / Reject — a
+	// destructive command must never be remembered as "allow always"
+	// (that would silently auto-execute the same rm -rf / terraform
+	// apply on every future invocation without prompting).
+	var options []openacp.PermissionOption
+	if hasRisk {
+		options = []openacp.PermissionOption{
+			{OptionID: "allow_once", Name: "Allow once", Kind: openacp.PermissionAllowOnce},
+			{OptionID: "reject_once", Name: "Reject", Kind: openacp.PermissionRejectOnce},
+		}
+	} else {
+		options = []openacp.PermissionOption{
+			{OptionID: "allow_once", Name: "Allow once", Kind: openacp.PermissionAllowOnce},
+			{OptionID: "allow_always", Name: "Allow always", Kind: openacp.PermissionAllowAlways},
+			{OptionID: "reject_once", Name: "Reject", Kind: openacp.PermissionRejectOnce},
+		}
+	}
+
 	resp, err := a.client.RequestPermission(ctx, openacp.RequestPermissionRequest{
 		SessionID: a.sessionID,
+		Meta:      meta,
 		ToolCall: openacp.ToolCallUpdate{
 			ToolCallID: call.ID,
 			Title:      opentool.ToolTitle(def.Name, call.Function.Arguments),
@@ -2382,18 +3089,7 @@ func (a *acpApprover) Ask(ctx context.Context, call hwcloud.ToolCall, def hwclou
 			Status:     "pending",
 			RawInput:   json.RawMessage(call.Function.Arguments),
 		},
-		// ACP semantics: allow_once = this call only (never remembered),
-		// allow_always = remembered for the session. For shell, the grant
-		// covers the command's atoms and file accesses (all of them must
-		// be remembered to skip approval — see governance.MemoryKeys), so
-		// a changed command or a new file target re-asks while reused
-		// ones don't. Cross-session rules are a separate configuration
-		// layer, not a button grant.
-		Options: []openacp.PermissionOption{
-			{OptionID: "allow_once", Name: "Allow Once", Kind: openacp.PermissionAllowOnce},
-			{OptionID: "allow_always", Name: "Allow Always", Kind: openacp.PermissionAllowAlways},
-			{OptionID: "reject_once", Name: "Reject", Kind: openacp.PermissionRejectOnce},
-		},
+		Options: options,
 	})
 	if err != nil {
 		return governance.Decision{Action: governance.Deny, Reason: "permission request failed: " + err.Error()}, nil
@@ -2418,7 +3114,7 @@ func (a *acpApprover) Ask(ctx context.Context, call hwcloud.ToolCall, def hwclou
 	case "allow_once":
 		// Deliberately NOT remembered (ACP allow_once semantics): the
 		// same tool + args asks again next time — a session-level grant
-		// is what "Allow Always" is for.
+		// is what "Allow always" is for.
 		return governance.Decision{Action: governance.Allow, Reason: "allow once"}, nil
 	case "allow_always":
 		// Session-scoped (ACP allow_always semantics): the same tool +
@@ -2426,6 +3122,15 @@ func (a *acpApprover) Ask(ctx context.Context, call hwcloud.ToolCall, def hwclou
 		// sessions — a cross-session rules layer (settings → governance
 		// Rule) is future work, not a button grant.
 		d := governance.Decision{Action: governance.Allow, Reason: "allow always"}
+		// A risk_note call was not offered "allow always" (only allow_once /
+		// reject), so a client sending allow_always here is either a bug or
+		// a non-compliant client. Destructive commands must never be
+		// remembered — treat it as allow_once (allow this call, do NOT
+		// persist to memory).
+		if hasRisk {
+			d = governance.Decision{Action: governance.Allow, Reason: "allow once (risk_note: allow_always ignored)"}
+			return d, nil
+		}
 		if a.memory != nil {
 			// Multi-key tools (shell command atoms + file accesses,
 			// write target) remember every key — the policy chain later
@@ -2468,9 +3173,11 @@ func (s *AgentServer) usageCost(ss *agentSession, usage hwcloud.Usage) *openacp.
 		cached = usage.PromptTokens
 	}
 	uncached := usage.PromptTokens - cached
-	amount := float64(uncached)*mc.InputCostPerToken +
-		float64(cached)*mc.InputCacheCostPerToken +
-		float64(usage.CompletionTokens)*mc.OutputCostPerToken
+	// Costs are USD per 1M tokens; divide by 1e6 to get the per-token rate.
+	const perMillion = 1_000_000
+	amount := (float64(uncached)*mc.InputCostPerMillion +
+		float64(cached)*mc.InputCacheCostPerMillion +
+		float64(usage.CompletionTokens)*mc.OutputCostPerMillion) / perMillion
 	return &openacp.Cost{Amount: amount, Currency: "USD"}
 }
 

@@ -15,6 +15,7 @@ import (
 	"github.com/skip2/go-qrcode"
 
 	"github.com/Cloud-Developer-Department/hwcloud/cmd/cli/config"
+	"github.com/Cloud-Developer-Department/hwcloud/version"
 )
 
 // FeishuCredentials holds resolved app credentials.
@@ -133,8 +134,8 @@ func registerFeishuApp(ctx context.Context, onQR func(url string, expireIn int))
 
 	result, err := registration.RegisterApp(ctx, &registration.Options{
 		AppPreset: &registration.AppPreset{
-			Name: "hwcloud-bot",
-			Desc: "AI coding agent powered by hwcloud",
+			Name: "bot",
+			Desc: "AI agent powered by " + version.Name,
 		},
 		Addons: &registration.AppAddons{
 			Scopes: registration.AppAddonsScopes{

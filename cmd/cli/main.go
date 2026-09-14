@@ -20,6 +20,7 @@ import (
 
 	"github.com/Cloud-Developer-Department/hwcloud/cmd/cli/config"
 	"github.com/Cloud-Developer-Department/hwcloud/cmd/cli/server"
+	"github.com/Cloud-Developer-Department/hwcloud/cmd/cli/tui"
 	"github.com/Cloud-Developer-Department/hwcloud/keyring"
 	plugin "github.com/Cloud-Developer-Department/hwcloud/plugin/cli"
 	cliwasm "github.com/Cloud-Developer-Department/hwcloud/plugin/cli/wasm"
@@ -35,14 +36,31 @@ func main() {
 
 	// 2. Read settings.json.
 	raw, err := os.ReadFile(cfgPath)
-	if err != nil && !os.IsNotExist(err) {
-		log.Fatalf("read settings: %v", err)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Fatalf("read settings: %v", err)
+		}
+		// First run: create an empty settings.json so the user has a file
+		// to edit, `settings get/list` works, and the fsnotify watcher has
+		// something to monitor. Defaults are applied in-memory by
+		// ApplyDefaults (step 5).
+		if wErr := config.WriteConfig(&config.Config{}, cfgPath); wErr != nil {
+			log.Printf("could not create %s: %v", cfgPath, wErr)
+		}
 	}
 	if len(raw) == 0 {
 		raw = []byte("{}")
 	}
 	var preCfg config.Config
-	if err := json.Unmarshal(raw, &preCfg); err != nil {
+	// Expand env-var references before parsing: the on-disk file may contain
+	// raw-mode tokens (unquoted ${PORT}) that are invalid JSON until ExpandBytes
+	// resolves them. Only .Plugins is read here (the plugin paths), so the
+	// expanded bytes are used solely to locate plugins — no secret exposure.
+	// `raw` itself stays literal so loadPlugins (main.go:86) receives the
+	// unexpanded bytes and the final ExpandBytes at main.go:96 resolves the
+	// complete merged document once.
+	preExpanded, _ := config.ExpandBytes(raw)
+	if err := json.Unmarshal(preExpanded, &preCfg); err != nil {
 		log.Fatalf("parse settings: %v", err)
 	}
 	if len(preCfg.Plugins) > 0 {
@@ -87,6 +105,15 @@ func main() {
 	}
 
 	// 5. Parse final merged config.
+	// Resolve environment-variable references in the raw JSON bytes before
+	// unmarshaling: "${API_KEY}" → string value, unquoted ${PORT} → raw
+	// JSON token (int/bool/null). loadPlugins merged raw bytes above, so
+	// plugin-injected ${...} references are resolved here too. The on-disk
+	// file stays literal; only the running process holds resolved secrets.
+	settings, warns := config.ExpandBytes(settings)
+	for _, w := range warns {
+		slog.Warn("settings: env var referenced but not set", "var", w)
+	}
 	var cfg config.Config
 	if err := json.Unmarshal(settings, &cfg); err != nil {
 		log.Fatalf("parse merged settings: %v", err)
@@ -97,6 +124,16 @@ func main() {
 	// Defaults come from the single source (config.ApplyDefaults) — the
 	// plugin-merged settings parse cannot use config.Load directly.
 	config.ApplyDefaults(&cfg, cfgPath)
+
+	// Enum validation (same check as reload + `settings validate`). At
+	// startup we WARN but do not fatal — the server can still run with a
+	// silent downgrade (e.g. log.level="BOGUS" → info). Surfacing it here
+	// means the operator knows immediately, and the reload gate (shared.go)
+	// can diff against these pre-existing violations to avoid blocking
+	// unrelated changes on a config that was already accepted at startup.
+	for _, v := range config.CheckEnums(&cfg) {
+		slog.Warn("settings: enum violation (use-time will silently downgrade)", "violation", v)
+	}
 
 	logCleanup, err := server.SetupLog(cfg.Log)
 	if err != nil {
@@ -113,7 +150,9 @@ func main() {
 	// 6. Build cobra tree.
 	rootCmd.AddCommand(buildServeCmd(cfg))
 	rootCmd.AddCommand(buildRunCmd(cfg))
+	rootCmd.AddCommand(buildTuiCmd(cfg))
 	rootCmd.AddCommand(keyringCmd)
+	rootCmd.AddCommand(buildSettingsCmd())
 
 	// 7. Wrap every command's RunE to notify observers on entry/exit.
 	// Treat context cancellation as normal shutdown — do not report
@@ -242,6 +281,39 @@ var rootCmd = &cobra.Command{
 	Short: "hwcloud CLI",
 }
 
+func init() {
+	// --cwd is a persistent flag so every subcommand (serve, run, tui)
+	// inherits it. When empty, os.Getwd() is used (backward compatible).
+	rootCmd.PersistentFlags().String("cwd", "", "Working directory (default: process cwd)")
+}
+
+// ── tui ──
+
+func buildTuiCmd(cfg config.Config) *cobra.Command {
+	return &cobra.Command{
+		Use:          "tui",
+		Short:        "Start the interactive TUI",
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if cwd, _ := cmd.Flags().GetString("cwd"); cwd != "" {
+				if err := os.Chdir(cwd); err != nil {
+					return fmt.Errorf("--cwd: %w", err)
+				}
+			}
+			// Configure logging the same way serve/run do, so TUI logs
+			// land in the file (never stderr — would corrupt alt-screen).
+			logCleanup, err := server.SetupLog(cfg.Log)
+			if err != nil {
+				log.Printf("WARNING: log setup failed, using defaults: %v", err)
+			}
+			if logCleanup != nil {
+				defer logCleanup()
+			}
+			return tui.StartInteractiveTUI(cmd.Context(), cfg)
+		},
+	}
+}
+
 // ── serve ──
 
 func buildServeCmd(cfg config.Config) *cobra.Command {
@@ -260,12 +332,24 @@ func buildServeCmd(cfg config.Config) *cobra.Command {
 			// fence is the 512 MiB linear-memory cap in the plugin
 			// loaders; this bounds the rest of the process.
 			debug.SetMemoryLimit(512 << 20)
+			// --cwd: chdir before anything else so all os.Getwd() calls
+			// (tools, skills, profiles, sandbox) resolve to the right
+			// directory. Empty = keep process cwd (backward compatible).
+			if cwd, _ := cmd.Flags().GetString("cwd"); cwd != "" {
+				if err := os.Chdir(cwd); err != nil {
+					return fmt.Errorf("--cwd: %w", err)
+				}
+			}
 			parseCapabilities(cmd, &caps)
 			isACP, _ := cmd.Flags().GetBool("acp")
 			channelFlag, _ := cmd.Flags().GetString("channel")
 			p, _ := cmd.Flags().GetInt("port")
 			if p > 0 {
 				cfg.Server.Port = p
+			}
+			h, _ := cmd.Flags().GetString("host")
+			if h != "" {
+				cfg.Server.Host = h
 			}
 			if sandboxEnabled, _ := cmd.Flags().GetBool("sandbox"); sandboxEnabled {
 				cfg.Sandbox.Enabled = true
@@ -301,14 +385,15 @@ func buildServeCmd(cfg config.Config) *cobra.Command {
 			}
 			defer cancel()
 			if isACP {
-				return server.RunACP(ctx, &cfg, caps)
+				return server.RunACP(ctx, &cfg)
 			}
-			return server.RunREST(ctx, &cfg, caps)
+			return server.RunREST(ctx, &cfg)
 		},
 	}
 	cmd.Flags().Bool("acp", false, "ACP mode over stdio")
 	cmd.Flags().String("channel", "", "Enable IM channel (\"feishu\", \"wechat\", or \"wecom\")")
 	cmd.Flags().Int("port", 0, "REST port (overrides settings)")
+	cmd.Flags().String("host", "", "REST listen address (overrides settings, default 127.0.0.1)")
 	cmd.Flags().Bool("sandbox", false, "Enable OS-native sandbox (bwrap/seatbelt) for shell commands")
 	addCapabilityFlags(cmd)
 	return cmd
@@ -372,9 +457,113 @@ Wrap your message in quotes when it contains spaces:
   %s run "analyze cmd/cli/main.go and summarize"`, version.Name, version.Name),
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if cwd, _ := cmd.Flags().GetString("cwd"); cwd != "" {
+				if err := os.Chdir(cwd); err != nil {
+					return fmt.Errorf("--cwd: %w", err)
+				}
+			}
 			return server.RunCLI(cmd.Context(), &cfg, args[0])
 		},
 	}
+	return cmd
+}
+
+// ── settings ──
+
+// buildSettingsCmd creates the `settings` subcommand for reading and
+// modifying settings.json. Supports dotted-path keys (e.g.
+// "telemetry.endpoint", "provider.openai.apikey"). Changes are written
+// atomically; a running server detects the file change via fsnotify and
+// hot-reloads applicable config (telemetry, log level, providers).
+func buildSettingsCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "settings",
+		Short: "Read and modify settings.json",
+	}
+	cmd.AddCommand(&cobra.Command{
+		Use:   "set <key> <value>",
+		Short: "Set a setting (dotted path, e.g. telemetry.endpoint)",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := config.SetSetting(args[0], args[1]); err != nil {
+				return fmt.Errorf("settings set: %w", err)
+			}
+			fmt.Fprintf(os.Stderr, "set %s = %s\n", args[0], args[1])
+			return nil
+		},
+	})
+	cmd.AddCommand(&cobra.Command{
+		Use:   "get <key>",
+		Short: "Get a setting value (dotted path)",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			val, err := config.GetSetting(args[0])
+			if err != nil {
+				return err
+			}
+			fmt.Fprintln(os.Stdout, val)
+			return nil
+		},
+	})
+	cmd.AddCommand(&cobra.Command{
+		Use:   "list",
+		Short: "List all settings",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			val, err := config.ListSettings()
+			if err != nil {
+				return err
+			}
+			fmt.Fprintln(os.Stdout, val)
+			return nil
+		},
+	})
+	cmd.AddCommand(&cobra.Command{
+		Use:   "append <key> <value>",
+		Short: "Append a value to an array setting (dotted path)",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := config.AppendSetting(args[0], args[1]); err != nil {
+				return fmt.Errorf("settings append: %w", err)
+			}
+			fmt.Fprintf(os.Stderr, "appended to %s\n", args[0])
+			return nil
+		},
+	})
+	cmd.AddCommand(&cobra.Command{
+		Use:   "delete <key>",
+		Short: "Delete a setting or array element (dotted path)",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := config.DeleteSetting(args[0]); err != nil {
+				return fmt.Errorf("settings delete: %w", err)
+			}
+			fmt.Fprintf(os.Stderr, "deleted %s\n", args[0])
+			return nil
+		},
+	})
+	cmd.AddCommand(&cobra.Command{
+		Use:   "validate",
+		Short: "Validate settings.json (env refs resolve, config parses, enums valid)",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			report, err := config.ValidateSettings()
+			if report != nil {
+				for _, w := range report.Warnings {
+					fmt.Fprintf(os.Stderr, "WARN: env var %q referenced but not set\n", w)
+				}
+				for _, v := range report.EnumViolations {
+					fmt.Fprintf(os.Stderr, "WARN: %s\n", v)
+				}
+			}
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "FAIL: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Fprintln(os.Stderr, "OK: settings.json is valid")
+			return nil
+		},
+	})
 	return cmd
 }
 

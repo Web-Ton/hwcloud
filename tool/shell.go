@@ -63,7 +63,7 @@ func platformShellArg() string {
 
 func (t *Shell) Definition() hwcloud.FunctionDefinition {
 	program := platformShell()
-	desc := fmt.Sprintf("Execute a command via %s. If the command finishes quickly, stdout/stderr/exit code are returned directly. If it runs longer, you'll get file paths to monitor progress — use `read` to check stdout.log, stderr.log, and exit.code.", program)
+	desc := fmt.Sprintf("Execute a command via %s. For reading, writing, or editing files, prefer the dedicated `read`, `write`, and `edit` tools. If the command finishes quickly, stdout/stderr/exit code are returned directly. If it runs longer, you'll get file paths to monitor progress — use `read` to check stdout.log, stderr.log, and exit.code.", program)
 	if t.sandbox == nil {
 		desc += " [UNAVAILABLE: no sandbox configured]"
 	} else if cwd := t.sandbox.CWD(); cwd != "" {
@@ -335,7 +335,8 @@ func truncateStr(s string, maxLen int) string {
 
 type ShellParams struct {
 	Command     string `json:"command" jsonschema:"description=The shell command to execute"`
-	Description string `json:"description,omitempty" jsonschema:"description=A short description of what this command does (for audit/logging)"`
+	Description string `json:"description,omitempty" jsonschema:"description=The intent of this command (3-8 words). Every command should have a purpose — provide this whenever possible."`
+	RiskNote    string `json:"risk_note,omitempty" jsonschema:"description=Only for HIGH-RISK operations with real-world consequences beyond file changes: spending money (cloud deploy, paid API call), reducing security (disabling firewall, exposing a port), breaking the system (rm -rf /, dd to disk), data loss at scale (DROP TABLE, git push --force to shared branch). Describe the consequence if it goes wrong (e.g. 'incurs cloud billing', 'exposes service to public internet'). Do NOT fill for ordinary file/dir operations (rm single file, rm build dir, mkdir, cp, mv). Empty = safe."`
 	Timeout     int    `json:"timeout,omitempty" jsonschema:"description=Seconds to wait before the command is backgrounded (default: 30, min: 1, max: 600)"`
 }
 

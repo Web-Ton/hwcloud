@@ -1,18 +1,18 @@
 ---
 name: powerpoint
-description: Create designed, editable PowerPoint .pptx presentations with PptxGenJS. Use when the user asks to create, generate, update, or inspect a deck, slide deck, presentation, or .pptx file.
+description: Create designed, editable PowerPoint .pptx presentations with PptxGenJS-Plus. Use when the user asks to create, generate, update, or inspect a deck, slide deck, presentation, or .pptx file.
 ---
 
 # PowerPoint
 
-Use this skill whenever a PowerPoint deck is involved. For new decks, pass a trusted PptxGenJS build script directly to the `pptx_write` tool. For filling or editing an existing template, call `pptx_template_analyze` first and then `pptx_template_fill` with the exact IDs returned by analysis.
+Use this skill whenever a PowerPoint deck is involved. For new decks, pass a PptxGenJS build script to the `pptx_write` tool — inline via `script` (preferred, for small decks) or via `script_path` for large decks whose script is written to a `.mjs` file. For filling or editing an existing template, call `pptx_template_analyze` first and then `pptx_template_fill` with the exact IDs returned by analysis.
 
 ## Workflow
 
 1. Decide the deck outline and choose a visual system: palette, typography, repeated motif, and slide rhythm.
 2. Write JavaScript module content that exports `default async function build(pptx, ctx)` or named `build(pptx, ctx)`.
 3. In the script, add slides directly with PptxGenJS. Do not generate HTML for this workflow.
-4. Call `pptx_write` with `path`, `script`, optional `assets_dir`, and optional `data`.
+4. Pass the script to `pptx_write`. **Prefer inline** (`script`) for small decks — pass `path`, `script`, optional `assets_dir`, and optional `data`. For large decks (many slides), writing the whole script inline bloats the tool call; instead write it to a `.mjs` file with the write tool (first call creates it, subsequent calls use `append=true` to add chunks), then pass `path` + `script_path`.
 5. Verify the result with `pptx_read`; for visual QA, convert the PPTX to images if the environment has LibreOffice and Poppler.
 
 ## Template Workflow
@@ -23,11 +23,14 @@ Use this skill whenever a PowerPoint deck is involved. For new decks, pass a tru
 
 ## Script Creation
 
-- Put the complete JavaScript module in the `script` argument.
-- Do not use `local_file_write` or shell commands to create a temporary `.mjs` file for this workflow.
-- If revising a deck, update the `script` content and call `pptx_write` again.
+- **Build environment.** The script runs in a Node.js worker spawned from a temp directory that has no `node_modules`. PptxGenJS-Plus, JSZip, and pako are already bundled into the worker, so they reach the script only as the `pptx` instance and the `ctx` argument of `build(pptx, ctx)` — not as importable modules. Node built-ins (`node:fs`, `node:path`, …) resolve from the temp file; npm packages do not, since there is no `node_modules` to resolve against.
+- **Inline (preferred)**: put the complete JavaScript module in the `script` argument. Best for small decks where the script is short.
+- **File path (large decks)**: when the script is large, writing it inline bloats the tool call and the model's thinking with script source. Instead use the write tool to create a `.mjs` file — first call writes it, subsequent calls pass `append=true` to append chunks — then pass its path as `script_path`. Either way the build function signature is the same: `default async function build(pptx, ctx)`.
+- If revising a deck, update the script (inline `script` or the `.mjs` file) and call `pptx_write` again.
 
 ## Tool Contract
+
+Inline (small deck):
 
 ```json
 {
@@ -41,7 +44,20 @@ Use this skill whenever a PowerPoint deck is involved. For new decks, pass a tru
 }
 ```
 
-The worker creates the PptxGenJS instance and writes the output file. The script only adds slides and content.
+File path (large deck — script written to a `.mjs` file via the write tool):
+
+```json
+{
+  "tool": "pptx_write",
+  "arguments": {
+    "path": "deck.pptx",
+    "script_path": "/tmp/deck.mjs",
+    "data": {"title": "Quarterly Review"}
+  }
+}
+```
+
+Pass exactly one of `script` or `script_path`. The worker creates the PptxGenJS instance and writes the output file. The script only adds slides and content.
 
 ```javascript
 export default async function build(pptx, ctx) {
@@ -79,6 +95,16 @@ export default async function build(pptx, ctx) {
 - Use editable text wherever practical; use images for photos, screenshots, logos, or complex visual backgrounds.
 - Add speaker notes when useful; `pptx_read` can surface them later.
 
+## Information Sources
+
+The tools available for retrieving external information are:
+
+- `websearch` — search-engine queries (returns titles, URLs, and snippets).
+- `webfetch` — fetch a known URL and extract its main text content.
+- `browser_navigate` / `browser_screenshot` / `browser_evaluate` / `browser_click`, and the `browser_use_*` family — for pages that require JavaScript rendering or interaction to surface their content.
+
+A deck's factual content (statistics, citations, quotes, dates, entity names, recent events) comes from outside the model. The model can only reproduce what was in its training data, which has a cutoff and is unreliable for precise figures, proper citations, or anything time-sensitive. `websearch` and `webfetch`/`browser_*` are how that external content reaches the model; without them, any specific fact in the script is a guess. Source URLs collected during research can be cited on slides or in notes.
+
 ## PptxGenJS Reference
 
 Use this reference when writing the JavaScript build script for the `pptx_write` tool.
@@ -96,7 +122,16 @@ export default async function build(pptx, ctx) {
 }
 ```
 
-Useful layouts: `LAYOUT_WIDE` (13.333 x 7.5 in), `LAYOUT_16X9` (10 x 5.625 in), `LAYOUT_4X3` (10 x 7.5 in). Use inches for all `x`, `y`, `w`, `h` values.
+Useful layouts: `LAYOUT_WIDE` (13.333 x 7.5 in), `LAYOUT_16X9` (10 x 5.625 in), `LAYOUT_4X3` (10 x 7.5 in). Dimensions accept inches (plain numbers) or unit-suffixed strings:
+
+```javascript
+// inches (default — plain number)
+slide.addText("Title", { x: 0.6, y: 0.4, w: 8, h: 0.6, fontSize: 36 });
+
+// centimeters / millimeters / points
+slide.addText("Title", { x: "1.5cm", y: "1cm", w: "20cm", h: "1.5cm", fontSize: 36 });
+slide.addShape(pptx.ShapeType.rect, { x: "0mm", y: "0mm", w: "338mm", h: "190mm" });
+```
 
 ### Text
 
@@ -132,6 +167,9 @@ slide.addShape(pptx.ShapeType.roundRect, {
 
 - Hex colors must not include `#`. Do not use 8-character hex for transparency — use `transparency` or `opacity`.
 - Use a fresh options object for each shape; PptxGenJS mutates some option values internally.
+- Preset shadows: `shadow: { type: "preset", preset: "shdw1" }` (shdw1–shdw20).
+- Picture fills on shapes: `fill: { type: "image", image: { data: ctx.imageData("bg.png"), sizing: { type: "cover" } } }`.
+- Connectors: `slide.addConnector({ x: 0.7, y: 6.8, w: 11.8, h: 0, line: { color: "CBD5E1", width: 1 } })`.
 
 ### Images and Icons
 
@@ -157,6 +195,17 @@ slide.addChart(pptx.ChartType.bar, [{ name: "Revenue", labels: ["Q1","Q2","Q3","
   x: 0.7, y: 1.2, w: 6.2, h: 3.8, barDir: "col", chartColors: ["2563EB"], showValue: true,
 });
 ```
+
+ChartEx types (PowerPoint 2016+): `pptx.ChartExType.funnel`, `treemap`, `sunburst`, `waterfall`, `histogram`, `boxWhisker`:
+
+```javascript
+slide.addChart(pptx.ChartExType.funnel, [{ name: "Pipeline", labels: ["Leads","Qualified","Demo","Close"], values: [1000,400,120,30] }], {
+  x: 0.7, y: 1.2, w: 6.2, h: 3.8, chartColors: ["2563EB","3B82F6","60A5FA","93C5FD"],
+});
+```
+
+- Table diagonal borders: `borderDiagonalDown: { color: "E5E7EB", pt: 1 }`.
+- Text fields for page numbers: `slide.addText({ text: "1", options: { field: "slidenum" } })`.
 
 ### Layout Ideas
 

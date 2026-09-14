@@ -10,9 +10,9 @@ import (
 // compactionInfo carries compaction observability back to the loop.
 type compactionInfo struct {
 	err         error
-	count       int                          // number of messages newly compressed
-	freedTokens int                          // prompt tokens the new summary removed (approx, can be 0)
-	from, to    int                          // global index range covered (for observability)
+	count       int                        // number of messages newly compressed
+	freedTokens int                        // prompt tokens the new summary removed (approx, can be 0)
+	from, to    int                        // global index range covered (for observability)
 	compressed  *hwcloud.CompressedContext // summary after this pass (nil if none)
 	// attempted is true when Compact was actually called (and the
 	// "context compacting..." pre-thought was sent to ch). The caller
@@ -140,14 +140,46 @@ func (rt *Runtime) prepareMemory(ctx context.Context, session hwcloud.Session, c
 	// ── Compaction pass: compress overflow messages ──
 	// The token scan walks only the post-summary increment (already
 	// compressed messages are not fetched at all).
-	overflow := len(msgs)
+	//
+	// Two-step logic:
+	//   1. Trigger check: compute the TOTAL token count of the working set.
+	//      Only when it exceeds the budget (real overflow) does compaction
+	//      fire — not at 20%, not at 50%, at 100%.
+	//   2. Retain target: once triggered, compress CompactRatio (default 80%)
+	//      of the budget and keep the most recent retainFraction (20%) as
+	//      headroom. The scan walks from the tail, and overflow lands where
+	//      cumulative tokens first exceed retainTarget.
+	//
+	// The previous code used retainTarget as the TRIGGER threshold (break at
+	// 20% → compaction fired at 20% of budget, far before real overflow).
+	// That caused premature compaction on small conversations, unnecessary
+	// summary growth, and a faster positive-feedback loop — the opposite of
+	// what CompactRatio was meant to fix.
+	retainFraction := 1.0 - rt.cfg.CompactRatio
+	if retainFraction <= 0 || retainFraction >= 1 {
+		retainFraction = 0.2 // default 0.8 ratio → retain 20%
+	}
+	retainTarget := int(float64(budget) * retainFraction)
+
+	// Single tail-to-head scan serves both purposes:
+	//   1. Trigger: after the full scan, `tokens` is the total working-set
+	//      size — compaction fires only when total > budget (real overflow).
+	//   2. Retain: if total > budget, the scan already recorded where
+	//      cumulative tokens first exceeded retainTarget — that's the
+	//      overflow point (compress everything before it, keep the tail).
+	// Each message's tokens are counted exactly once.
+	// modelID already declared above (L110); reused here.
+	overflow := len(msgs) // default: no compaction (budget fits)
 	tokens := 0
 	for i := len(msgs) - 1; i >= 0; i-- {
-		tokens += hwcloud.CountMessageTokens(hwcloud.TokenizerModelID(rt.runModel), msgs[i])
-		if tokens > budget {
-			overflow = i + 1
-			break
+		tokens += hwcloud.CountMessageTokens(modelID, msgs[i])
+		if tokens > retainTarget && overflow == len(msgs) {
+			overflow = i + 1 // first (from tail) index past retainTarget
 		}
+	}
+	// Trigger check: only compact on real overflow, not at retainTarget.
+	if tokens <= budget {
+		overflow = len(msgs) // total fits budget — no compaction
 	}
 	if overflow < len(msgs) {
 		overflow = hwcloud.SafeCompressionBoundary(msgs, overflow)
@@ -166,8 +198,11 @@ func (rt *Runtime) prepareMemory(ctx context.Context, session hwcloud.Session, c
 			// no explanation. The follow-up ("compacted N tokens" /
 			// "failed") is emitted by run() after this returns.
 			chSend(ctx, ch, hwcloud.StreamEvent{
-				Type: hwcloud.StreamThought,
-				Text: "context compacting...\n",
+				Type: hwcloud.StreamCompacting,
+				Compaction: &hwcloud.CompactionInfo{
+					OverflowTokens: overflow,
+					TotalMessages:  len(msgs),
+				},
 			})
 			ci.attempted = true
 			hwcloud.ObserveDecision(ctx, rt.deps.Observer, hwcloud.DecisionEvent{
@@ -195,15 +230,14 @@ func (rt *Runtime) prepareMemory(ctx context.Context, session hwcloud.Session, c
 						ci.count = cc.ThroughIndex - oldTI
 						ci.from = oldTI
 						ci.to = cc.ThroughIndex
-						// freedTokens mirrors CompressAll's accounting so the
-						// ACP "Compacted N messages → summary (freed ~K tokens)"
-						// thought is consistent with the /compact slash echo:
-						// tokens the newly-compressed messages occupied, minus
-						// the tokens the summary now occupies. msgs[overflow:]
-						// is exactly the post-summary working set retained in
-						// the prompt (the head was just folded into cc).
+						// freedTokens = tokens freed by compaction: the
+						// compressed messages (msgs[:overflow]) minus the
+						// summary that replaces them. This mirrors
+						// CompressAll's accounting so the ACP "Compacted N
+						// messages → summary (freed ~K tokens)" thought is
+						// consistent with the /compact slash echo.
 						modelID := hwcloud.TokenizerModelID(rt.runModel)
-						freed := hwcloud.CountMessages(modelID, msgs[overflow:])
+						freed := hwcloud.CountMessages(modelID, msgs[:overflow])
 						freed -= hwcloud.CountMessageTokens(modelID, hwcloud.Message{
 							Role:    hwcloud.RoleSystem,
 							Content: cc.Summary,

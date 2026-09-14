@@ -67,14 +67,14 @@ type PlanDef struct {
 
 // StepResult holds the outcome of executing one step.
 type StepResult struct {
-	Status      StepStatus      `json:"status"`
-	Summary     string          `json:"summary"`         // LLM-generated concise summary
-	FinalOutput string          `json:"final_output"`    // raw agent output (may be truncated)
-	Error       string          `json:"error,omitempty"` // error message if failed
-	Retries     int             `json:"retries"`         // actual retry count
+	Status      StepStatus    `json:"status"`
+	Summary     string        `json:"summary"`         // LLM-generated concise summary
+	FinalOutput string        `json:"final_output"`    // raw agent output (may be truncated)
+	Error       string        `json:"error,omitempty"` // error message if failed
+	Retries     int           `json:"retries"`         // actual retry count
 	Usage       hwcloud.Usage `json:"usage"`           // token usage from this step
-	StartTime   time.Time       `json:"start_time"`
-	EndTime     time.Time       `json:"end_time"`
+	StartTime   time.Time     `json:"start_time"`
+	EndTime     time.Time     `json:"end_time"`
 	// RunID is the child agent's run ID for this step (#1). Joins the
 	// step to its agent trajectory via RunResult.RunID; the child's
 	// ParentRunID points back to the plan's PlanRunID. Blank when the
@@ -106,11 +106,11 @@ type PlanState struct {
 
 // PlanResult is the final output of a plan execution.
 type PlanResult struct {
-	Goal        string          `json:"goal"`
-	FinalOutput string          `json:"final_output"`
-	Steps       []StepResult    `json:"steps"` // in execution order
+	Goal        string        `json:"goal"`
+	FinalOutput string        `json:"final_output"`
+	Steps       []StepResult  `json:"steps"` // in execution order
 	Usage       hwcloud.Usage `json:"usage"`
-	ReplanCount int             `json:"replan_count"`
+	ReplanCount int           `json:"replan_count"`
 	// PlanRunID is the plan-level run ID (#1): joins all step RunIDs via
 	// their ParentRunID and survives replan. Echoed from executor.planRunID
 	// by buildResult. A consumer reassembles the full plan trajectory by

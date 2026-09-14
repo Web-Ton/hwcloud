@@ -29,7 +29,7 @@ type TeamHandler struct {
 	// resolves through this; the chosen model overrides every team agent's
 	// model for that run via hwcloud.Session.Model (runner.go:68-70).
 	models    map[string]hwcloud.Model // "provider/modelId" → model instance
-	modelList []ModelInfo                // ordered list for /models endpoint
+	modelList []ModelInfo              // ordered list for /models endpoint
 	modelsMu  sync.RWMutex
 
 	sm *sessionManager[*teamSessionState] // session CRUD, store, bus

@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"testing"
 
-	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 	hwcloud "github.com/Cloud-Developer-Department/hwcloud"
+	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // echoTool is a simple hwcloud.Tool for testing.
@@ -209,11 +209,11 @@ func TestSessionNamedToolPrefix(t *testing.T) {
 // names fall back to "mcp".
 func TestSanitizeName(t *testing.T) {
 	cases := map[string]string{
-		"filesystem":  "filesystem",
-		"my server!":  "my-server-",
-		"abc/def":     "abc-def",
+		"filesystem": "filesystem",
+		"my server!": "my-server-",
+		"abc/def":    "abc-def",
 		"中文名":        "---",
-		"":            "mcp",
+		"":           "mcp",
 	}
 	for in, want := range cases {
 		if got := sanitizeName(in); got != want {

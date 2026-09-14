@@ -197,6 +197,25 @@ func (e *Engine) Evaluate(ctx context.Context, call hwcloud.ToolCall, def hwclou
 		}
 	}
 
+	// 0) Risk-note bypass: if the tool call carries a non-empty risk_note
+	// (shell tool's risk_note param for destructive commands), route to the
+	// human layer BEFORE any other layer — including "allow all" rules and
+	// remembered "allow always" (Memory layer). A destructive command
+	// (rm -rf, terraform apply) must not silently execute just because a
+	// similar safe command was remembered.
+	//
+	// "Route to the human layer" does NOT always mean "prompt the user":
+	// the HumanApprover (acpApprover) decides based on session mode. In auto
+	// mode the approver allows everything (including risk_note) without
+	// prompting; in semi-auto/manual it prompts. The point of this bypass is
+	// to SKIP the Memory layer for risk_note calls — a remembered allow_always
+	// must never auto-execute a destructive command — not to override the
+	// mode decision.
+	if HasRiskNote(call) {
+		emit(hwcloud.DecisionPolicyRule, hwcloud.OutcomeAsk, map[string]any{"reason": "risk_note present — forcing approval"})
+		return e.askHuman(ctx, call, def, session, "risk_note present")
+	}
+
 	// 1) Rules layer.
 	for _, rule := range e.Rules {
 		if !matchesRule(rule, call) {
@@ -314,6 +333,12 @@ func NewToolClassifier() *ToolClassifier {
 		// Office read-only tools: word_read/excel_read/pptx_read only read.
 		// write/template_fill create files and stay Dangerous (require approval).
 		"word_read": true, "excel_read": true, "pptx_read": true,
+		// Sub-agent delegation: the delegation tool itself is a read-only
+		// dispatch (no side effect beyond what the child's own gated tools
+		// do). The child inherits the parent's policy/approver, so its tool
+		// calls are individually gated. sub_agent_send continues the same
+		// child under the same gating.
+		"sub_agent_send": true,
 	}}
 }
 
@@ -323,4 +348,19 @@ func (c *ToolClassifier) Classify(def hwcloud.FunctionDefinition) SafetyClass {
 		return ReadOnly
 	}
 	return Dangerous
+}
+
+// HasRiskNote reports whether the tool call's arguments include a non-empty
+// "risk_note" field. Used by the policy engine (layer 0 bypass) and
+// allowAllPolicy (fail-closed deny) to force human approval for destructive
+// commands even when "allow always" was previously granted or no approver
+// is configured.
+func HasRiskNote(call hwcloud.ToolCall) bool {
+	var params struct {
+		RiskNote string `json:"risk_note"`
+	}
+	if err := json.Unmarshal([]byte(call.Function.Arguments), &params); err != nil {
+		return false
+	}
+	return strings.TrimSpace(params.RiskNote) != ""
 }

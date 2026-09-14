@@ -3,8 +3,8 @@ package kernel
 import (
 	"context"
 
-	"github.com/google/uuid"
 	hwcloud "github.com/Cloud-Developer-Department/hwcloud"
+	"github.com/google/uuid"
 )
 
 // CompressStats reports the outcome of a manual compaction.
@@ -179,45 +179,4 @@ func (rt *Runtime) CompressAll(ctx context.Context, sessionID string) (*Compress
 		Subject: sessionID, Detail: detail,
 	})
 	return st, nil
-}
-
-// ContextUsage reports the current per-layer context usage for a session:
-// summary tokens (compressed history), working tokens (uncompressed
-// messages), and the model's context window. Powers /context.
-func (rt *Runtime) ContextUsage(ctx context.Context, sessionID string) (summary, working, window int, err error) {
-	rt.mu.RLock()
-	cfgModel := rt.cfg.Model
-	rt.mu.RUnlock()
-	model := rt.runModel
-	if model == nil {
-		model = cfgModel
-	}
-	modelID := hwcloud.TokenizerModelID(model)
-	var throughIndex int
-	if rt.deps.Compressor != nil {
-		if cc, err := rt.deps.Compressor.Compressed(ctx, sessionID); err == nil && cc != nil {
-			throughIndex = cc.ThroughIndex
-			summary = hwcloud.CountMessageTokens(modelID, hwcloud.Message{
-				Role:    hwcloud.RoleSystem,
-				Content: cc.Summary,
-			})
-		}
-	}
-	if rt.deps.SessionStore != nil {
-		total, err := rt.deps.SessionStore.Count(ctx, sessionID)
-		if err != nil {
-			return 0, 0, window, err
-		}
-		// Post-summary increment only — messages never deleted, and the
-		// summary covers up to throughIndex, so fetching all would
-		// double-count summarized history.
-		msgs, err := rt.deps.SessionStore.RecentAfter(ctx, sessionID, throughIndex, total-throughIndex)
-		if err == nil {
-			working = hwcloud.CountMessages(modelID, msgs)
-		}
-	}
-	if model != nil {
-		window = model.ContextWindow()
-	}
-	return summary, working, window, nil
 }

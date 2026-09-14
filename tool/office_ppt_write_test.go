@@ -20,7 +20,7 @@ func TestPptxWriteSmoke(t *testing.T) {
 	script := `
 export default async function build(pptx, ctx) {
   const slide = pptx.addSlide();
-  slide.addText("Hello from Hwcloud PPT!", { x: 1, y: 1, w: 8, h: 1, fontSize: 36, bold: true });
+  slide.addText("Hello from OpenAgent PPT!", { x: 1, y: 1, w: 8, h: 1, fontSize: 36, bold: true });
 }
 `
 	outPath := t.TempDir() + "/test.pptx"

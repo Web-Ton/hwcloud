@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 
@@ -21,6 +22,7 @@ import (
 
 	"github.com/Cloud-Developer-Department/hwcloud/cmd/cli/config"
 	ctxpkg "github.com/Cloud-Developer-Department/hwcloud/context"
+	"github.com/Cloud-Developer-Department/hwcloud/guard/llm"
 )
 
 // RunACP starts the agent in ACP mode over stdio.
@@ -32,12 +34,25 @@ import (
 //  4. Wire summarizer for long-conversation compression.
 //  5. Construct the agent.
 //  6. Wrap in AgentServer, launch ACP protocol mux on stdin/stdout.
-func RunACP(ctx context.Context, cfg *config.Config, caps config.Capabilities) error {
-	ms, knowledge, sessionStore, cleanup, err := buildMemory(cfg.Embedding, caps.OnEmbedder())
+func RunACP(ctx context.Context, cfg *config.Config) error {
+	server, cleanup, err := BuildACPServer(ctx, cfg)
 	if err != nil {
 		return err
 	}
 	defer cleanup()
+	slog.Info("ACP server starting on stdio")
+	return server.Run(ctx)
+}
+
+// BuildACPServer constructs the ACP server (memory, models, tools, agent,
+// channels) and returns it with a cleanup func. Used by both RunACP (stdio)
+// and RunACPTransport (in-process pipe for the TUI).
+func BuildACPServer(ctx context.Context, cfg *config.Config) (*openacpsdk.Server, func(), error) {
+	caps := cfg.Capabilities
+	ms, knowledge, sessionStore, cleanup, err := buildMemory(cfg.Embedding, caps.OnEmbedder())
+	if err != nil {
+		return nil, nil, err
+	}
 
 	_, modelInfos := buildModels(cfg.Provider)
 	if len(modelInfos) == 0 {
@@ -46,18 +61,28 @@ func RunACP(ctx context.Context, cfg *config.Config, caps config.Capabilities) e
 
 	modelMap := make(map[string]hwcloud.Model, len(modelInfos))
 	for _, mi := range modelInfos {
-		key := mi.ID
-		if mi.Provider != "" {
-			key = mi.Provider + "/" + mi.ID
-		}
-		modelMap[key] = mi.Model
+		modelMap[mi.Key()] = mi.Model
 	}
 
 	// Summarizer and Memory are enabled by default; allow --summarizer=off
 	// and --memory=off to disable them.
-	var firstM hwcloud.Model
-	if len(modelInfos) > 0 {
-		firstM = modelInfos[0].Model
+
+	// srv is declared here so dynamicModel (below) can close over the
+	// variable — the closure reads srv at CALL time, not construction time,
+	// so it sees the assigned value once NewAgentServer returns. This lets
+	// the summarizer/extractor/guard be constructed with the real resolver
+	// in one pass, with no placeholder + later SetModelFn override.
+	var srv *acp.AgentServer
+	dynamicModel := func() hwcloud.Model {
+		if srv == nil {
+			return nil
+		}
+		if id := srv.GetDefaultModelID(); id != "" {
+			if m, ok := srv.LookupModel(id); ok {
+				return m
+			}
+		}
+		return nil
 	}
 
 	// Tools and sandbox are created once per session (buildRuntimeForSession)
@@ -66,18 +91,31 @@ func RunACP(ctx context.Context, cfg *config.Config, caps config.Capabilities) e
 	// kernel.Deps.
 	opts := []agent.Option{
 		agent.WithSystemPrompts(resolveProfiles("")...),
-		agent.WithMaxTurns(100),
+		agent.WithMaxTurns(500),
 	}
-	opts, skillProvider := buildOpts(opts, caps, firstM)
+	// The guard resolves the judge model via dynamicModel (server default),
+	// so it stays in sync with runtime model switches / api_key changes.
+	// Guard is a template-level shared component (not per-session); it reads
+	// the server default, not each session's model. buildOpts only handles
+	// skills + sub-agents.
+	if caps.OnGuard() {
+		g := llm.NewWithLookup(dynamicModel)
+		opts = append(opts, agent.WithInputGuard(g))
+		opts = append(opts, agent.WithOutputGuard(g.Output()))
+	}
+	opts, skillProvider := buildOpts(opts, caps)
 	agentCfg := agent.New(version.Name, opts...)
 
-	tracer, telemetryShutdown, err := setupTelemetry(ctx, *cfg)
+	holder, _, telemetryShutdown, err := setupTelemetry(ctx, *cfg)
 	if err != nil {
-		return fmt.Errorf("telemetry init: %w", err)
+		return nil, nil, fmt.Errorf("telemetry init: %w", err)
 	}
-	defer telemetryShutdown()
+	// NOTE: telemetryShutdown is NOT deferred here — BuildACPServer returns
+	// immediately and its defers would fire before server.Run starts, shutting
+	// down the TracerProvider prematurely. It is wired into the returned
+	// cleanup func so the caller defers it at the right scope.
 
-	deps := buildRuntimeDeps(caps, cfg.Sensitive, tracer)
+	deps := buildRuntimeDeps(caps, cfg.Sensitive, holder)
 	deps.SkillProvider = skillProvider
 	// Pass nil Mem when --memory=off so the AgentServer skips history
 	// replay and memory cleanup (all s.Mem uses are nil-guarded). The
@@ -88,10 +126,14 @@ func RunACP(ctx context.Context, cfg *config.Config, caps config.Capabilities) e
 		deps.MemoryProvider = knowledge
 	}
 
+	// Summarizer resolves the model via dynamicModel at call time. Summarize
+	// is nil-safe (returns an error → prepare.go degrades to tail-trim), so
+	// construction does not depend on a model being configured yet.
 	var sumz *summarizer.Compressor
-	if caps.OnMemory() && caps.OnSummarizer() && firstM != nil {
-		sumz = summarizer.New(firstM).WithMaxTokens(agentCfg.MaxCompressedTokens)
+	if caps.OnMemory() && caps.OnSummarizer() {
+		sumz = summarizer.NewWithLookup(dynamicModel).WithMaxTokens(agentCfg.MaxCompressedTokens)
 		ms.WithSummarizer(sumz)
+		deps.Summarizer = sumz
 	}
 
 	// Plugin manager — loads agent:tools and agent:observers plugins.
@@ -118,19 +160,22 @@ func RunACP(ctx context.Context, cfg *config.Config, caps config.Capabilities) e
 		}
 	}
 
-	if err := applyContextProviders(cfg, &deps); err != nil {
-		return err
+	providerCleanup, err := applyContextProviders(cfg, &deps)
+	if err != nil {
+		return nil, nil, err
 	}
 	// The extractor captures the MemoryProvider it writes to — build it
 	// AFTER applyContextProviders so the effective provider is used.
 	// Building it earlier would fork writes to the local sqlite store
 	// while Recall reads the OpenViking index (silent knowledge loss).
+	// NewLLMExtractor is nil-safe (nil model → no-op), so construction does
+	// not depend on a model being configured yet.
 	var extractor *ctxpkg.AsyncExtractor
-	if caps.OnMemory() && firstM != nil && deps.MemoryProvider != nil {
-		extractor = ctxpkg.NewAsyncExtractor(ctxpkg.NewLLMExtractor(firstM, deps.MemoryProvider))
+	if caps.OnMemory() && deps.MemoryProvider != nil {
+		extractor = ctxpkg.NewAsyncExtractor(ctxpkg.NewLLMExtractor(dynamicModel, deps.MemoryProvider))
 		deps.Extractor = extractor
 	}
-	srv := acp.NewAgentServer(agentCfg, deps, sessionStore, modelMap)
+	srv = acp.NewAgentServer(agentCfg, deps, sessionStore, modelMap)
 	srv.AgentName = version.Name
 	srv.AgentVersion = version.Version
 	srv.MCPEnabled = caps.OnMCP()
@@ -141,18 +186,19 @@ func RunACP(ctx context.Context, cfg *config.Config, caps config.Capabilities) e
 	srv.ProfileResolver = func(cwd string) []string {
 		return resolveProfiles(cwd)
 	}
+	// Wire settings-declared MCP servers so the global config is honored in
+	// ACP mode (not just client-advertised ones). mergeMcpServers combines
+	// these with the client's per-session list at connect time.
+	srv.SetSettingsMcpServers(convertMcpServers(cfg.McpServers))
 
 	// Register model configs for runtime_set_model_config.
 	for _, mi := range modelInfos {
-		key := mi.ID
-		if mi.Provider != "" {
-			key = mi.Provider + "/" + mi.ID
-		}
-		srv.RegisterModel(key, mi.Provider, mi.ID, mi.APIKey, mi.BaseURL, acp.ModelPricing{
-			MaxOutputTokens:        mi.MaxOutputTokens,
-			InputCostPerToken:      mi.InputCostPerToken,
-			InputCacheCostPerToken: mi.InputCacheCostPerToken,
-			OutputCostPerToken:     mi.OutputCostPerToken,
+		srv.RegisterModel(mi.Key(), mi.Provider, mi.ID, mi.APIKey, mi.BaseURL, acp.ModelPricing{
+			MaxInputTokens:           mi.MaxInputTokens,
+			MaxOutputTokens:          mi.MaxOutputTokens,
+			InputCostPerMillion:      mi.InputCostPerMillion,
+			InputCacheCostPerMillion: mi.InputCacheCostPerMillion,
+			OutputCostPerMillion:     mi.OutputCostPerMillion,
 		})
 	}
 
@@ -165,7 +211,7 @@ func RunACP(ctx context.Context, cfg *config.Config, caps config.Capabilities) e
 	}
 
 	policy := sandboxPolicy(cfg.Sandbox)
-	baseToolList := []string{"shell", "read", "write", "ls", "grep", "websearch", "webfetch"}
+	baseToolList := []string{"shell", "read", "write", "ls", "grep", "websearch", "webfetch", "settings"}
 	if caps.OnBrowser() {
 		baseToolList = append(baseToolList, "browser")
 	}
@@ -182,6 +228,49 @@ func RunACP(ctx context.Context, cfg *config.Config, caps config.Capabilities) e
 	}
 	server := openacpsdk.NewServer(version.Name, version.Version, srv)
 	server.SetLogger(slog.Default())
+
+	// Register the settings watcher so the settings tool's reload action
+	// can apply changes on demand. fsnotify auto-reload is disabled —
+	// settings changes are applied only via explicit reload (agent calls
+	// set → reload, or operator runs `hwcloud settings reload`).
+	// TODO: re-enable fsnotify with a non-broadcast notification mechanism
+	// (e.g. DynamicContext injection on next user turn) instead of
+	// broadcasting idle turns to all sessions.
+	activeWatcher.Store(&settingsWatcher{
+		cfgPath:  config.Path(),
+		prev:     cfg,
+		holder:   holder,
+		shutdown: telemetryShutdown,
+		srv:      srv,
+	})
+	// Inject settings callbacks so /settings slash commands and the settings
+	// tool can operate on settings.json without acp importing cmd/cli/config.
+	reloadFn := func(ctx context.Context) acp.ReloadResult {
+		sw := activeWatcher.Load()
+		if sw == nil {
+			return acp.ReloadResult{ParseError: "no settings watcher configured"}
+		}
+		r := sw.reload(ctx)
+		return acp.ReloadResult{
+			Applied:    r.Applied,
+			Violations: r.Violations,
+			ParseError: r.ParseError,
+		}
+	}
+	settingsReloadFn.Store(&reloadFn)
+	srv.SetSettingsCallbacks(acp.SettingsCallbacks{
+		List: config.ListSettings,
+		Get:  config.GetSetting,
+		Set:  config.SetSetting,
+		Validate: func() (warnings, violations []string, err error) {
+			report, err := config.ValidateSettings()
+			if err != nil {
+				return nil, nil, err
+			}
+			return report.Warnings, report.EnumViolations, nil
+		},
+		Reload: reloadFn,
+	})
 
 	// Channel agent: clone the template and inject a default Model + Tools
 	// so the IM bot can run standalone (the ACP path resolves the model per
@@ -210,6 +299,27 @@ func RunACP(ctx context.Context, cfg *config.Config, caps config.Capabilities) e
 		slog.Warn("channel error", "error", err)
 	}
 
-	slog.Info("ACP server starting on stdio")
-	return server.Run(ctx)
+	// Wrap cleanup to also flush context providers (e.g. OpenViking
+	// session) and shutdown telemetry (TracerProvider flush). This runs
+	// when the caller defers cleanup() — after server.Run exits.
+	teardown := func() {
+		if providerCleanup != nil {
+			providerCleanup()
+		}
+		cleanup()
+		telemetryShutdown()
+	}
+	return server, teardown, nil
+}
+
+// RunACPTransport builds the ACP server (same as RunACP) but serves on
+// custom I/O streams instead of os.Stdin/os.Stdout. Used by the TUI to
+// run the ACP server in-process via io.Pipe — no subprocess needed.
+func RunACPTransport(ctx context.Context, cfg *config.Config, w io.Writer, r io.Reader) error {
+	server, cleanup, err := BuildACPServer(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	return server.RunTransport(ctx, w, r)
 }

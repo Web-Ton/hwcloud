@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.4"
+
+      - name: Build
+        run: go build ./...
+
+      - name: Gofmt
+        run: |
+          set +e
+          unformatted=$(gofmt -l . | grep -v vendor | grep -v third_party)
+          if [ -n "$unformatted" ]; then
+            echo "::error::Files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi

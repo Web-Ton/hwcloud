@@ -48,7 +48,6 @@ import (
 	"syscall"
 	"time"
 
-	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/Cloud-Developer-Department/hwcloud/cmd/mcp/iac-server/agent"
 	iacmcp "github.com/Cloud-Developer-Department/hwcloud/cmd/mcp/iac-server/mcp"
 	"github.com/Cloud-Developer-Department/hwcloud/cmd/mcp/iac-server/provider"
@@ -63,6 +62,7 @@ import (
 	skillfs "github.com/Cloud-Developer-Department/hwcloud/skill/fs"
 	"github.com/Cloud-Developer-Department/hwcloud/summarizer"
 	"github.com/Cloud-Developer-Department/hwcloud/version"
+	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 func main() {

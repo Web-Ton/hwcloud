@@ -24,6 +24,11 @@ func ToolTitle(name string, args string) string {
 		URL         string `json:"url"`
 		Name        string `json:"name"`
 		Template    string `json:"template"`
+		Task        string `json:"task"`
+		AgentID     string `json:"agent_id"`
+		Action      string `json:"action"`
+		Key         string `json:"key"`
+		Append      bool   `json:"append"`
 	}
 	if err := json.Unmarshal([]byte(args), &params); err != nil {
 		return name
@@ -41,9 +46,16 @@ func ToolTitle(name string, args string) string {
 			}
 			return name + " " + base
 		}
-	case "edit", "write", "ls":
+	case "edit", "ls":
 		if params.Path != "" {
 			return name + " " + params.Path
+		}
+	case "write":
+		if params.Path != "" {
+			if params.Append {
+				return "append " + params.Path
+			}
+			return "write " + params.Path
 		}
 	case "feishu_sendfile":
 		if params.Path != "" {
@@ -115,6 +127,32 @@ func ToolTitle(name string, args string) string {
 		if params.Path != "" {
 			return name + " " + params.Path
 		}
+	case "sub_agent_send":
+		// sub_agent_send <agent_id> <description>
+		if params.AgentID != "" && params.Description != "" {
+			return name + " " + params.AgentID + " " + params.Description
+		}
+		if params.AgentID != "" {
+			return name + " " + params.AgentID
+		}
+	case "settings":
+		// settings <action> [key] — e.g. "settings set telemetry.endpoint"
+		if params.Action != "" {
+			if params.Key != "" {
+				return name + " " + params.Action + " " + params.Key
+			}
+			return name + " " + params.Action
+		}
+	}
+	// Sub-agent delegation tools (explorer, general, user-defined): the tool
+	// name is the agent name, identified by the presence of a "task" field
+	// (which no built-in tool uses). MCP tools have "servername_" prefix
+	// and don't carry "task", so they won't match here.
+	if params.Task != "" {
+		if params.Description != "" {
+			return "subagent " + name + "(" + params.Description + ")"
+		}
+		return "subagent " + name
 	}
 	return name
 }
@@ -132,11 +170,19 @@ func StripURLQuery(rawURL string) string {
 	return u.String()
 }
 
-// TruncateToolArg truncates s to n characters, adding "..." at the end.
+// TruncateToolArg truncates s to n runes, adding "..." at the end.
+// Truncates by rune, not byte: byte-slicing can cut a multi-byte UTF-8
+// sequence in half, producing invalid UTF-8 (e.g. a 3-byte CJK rune cut
+// at byte 2 leaves a stray byte that renders as a replacement character).
 func TruncateToolArg(s string, n int) string {
 	s = strings.TrimSpace(s)
-	if len(s) <= n {
+	runes := []rune(s)
+	if len(runes) <= n {
 		return s
 	}
-	return s[:n-3] + "..."
+	// n < 3 means the ellipsis itself doesn't fit — return just "...".
+	if n < 3 {
+		return "..."
+	}
+	return string(runes[:n-3]) + "..."
 }

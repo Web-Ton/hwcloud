@@ -12,7 +12,10 @@ package kernel
 
 import (
 	"context"
+	"fmt"
+	"log/slog"
 	"sync"
+	"time"
 
 	hwcloud "github.com/Cloud-Developer-Department/hwcloud"
 	"github.com/Cloud-Developer-Department/hwcloud/agent"
@@ -26,13 +29,15 @@ import (
 )
 
 // errNoModel is returned when neither the config nor the session provides
-// a model.
+// a model. The message stays free of Go-API symbols so it reads cleanly to
+// end users (CLI/TUI) and embedding developers alike — the caller layer
+// knows how models are configured for its surface and can wrap if needed.
 var errNoModel = &noModelError{}
 
 type noModelError struct{}
 
 func (*noModelError) Error() string {
-	return "no model configured (set agent.WithModel or session.Model)"
+	return "no model configured (configure a model on the agent or session)"
 }
 
 // Deps are the runtime dependencies injected at construction — everything
@@ -55,6 +60,17 @@ type Deps struct {
 	SessionStore session.SessionStore
 	// Compressor owns token-budget compression (summary layer).
 	Compressor session.Compressor
+	// Summarizer is the model-backed summarizer shared with sub-agent
+	// children so their in-memory stores get compaction parity with the
+	// parent. nil = sub-agents degrade to no-compaction. The parent's own
+	// Compressor (a *sqlite.MessageStore) embeds its summarizer privately;
+	// this field is the explicit, shareable handle.
+	Summarizer hwcloud.Summarizer
+	// SubAgentRegistry tracks resumable sub-agent children for the session.
+	// nil = kernel.New creates a fresh one. Shared by subAgentTool (spawn)
+	// and sendTool (continue) so both address the same live children.
+	// Children use in-memory stores distinct from normal (on-disk) sessions.
+	SubAgentRegistry *childRegistry
 	// MemoryProvider stores/recalls durable knowledge (long-term).
 	MemoryProvider ctxpkg.MemoryProvider
 
@@ -131,6 +147,13 @@ type Runtime struct {
 	state          *ctxpkg.RuntimeState
 }
 
+// SubAgentRegistry returns the session's child registry, or nil when no
+// sub-agents are configured. The ACP layer uses this to wire the onExit
+// completion callback for async sub-agent notifications.
+func (rt *Runtime) SubAgentRegistry() *childRegistry {
+	return rt.deps.SubAgentRegistry
+}
+
 // New creates a Runtime from an agent config and dependencies.
 func New(cfg *agent.Agent, deps Deps) *Runtime {
 	rt := &Runtime{
@@ -158,9 +181,23 @@ func New(cfg *agent.Agent, deps Deps) *Runtime {
 	}
 	// Pre-configured sub-agents become delegation tools: isolated context,
 	// own system prompt, tools resolved at call time (see newSubAgentTool).
-	// Registered in New so the model sees them from the first turn.
+	// Registered in New so the model sees them from the first turn. A shared
+	// childRegistry (one per session, lazily created here) lets sub_agent_send
+	// resume a child spawned by a subAgentTool — both tools hold the same reg.
+	if deps.SubAgentRegistry == nil {
+		deps.SubAgentRegistry = newChildRegistry()
+		rt.deps.SubAgentRegistry = deps.SubAgentRegistry
+	}
 	for _, sa := range cfg.SubAgents {
-		rt.tools = append(rt.tools, rt.newSubAgentTool(sa))
+		rt.tools = append(rt.tools, rt.newSubAgentTool(sa, deps.SubAgentRegistry))
+	}
+	// sub_agent_send lets the model follow up on a spawned sub-agent with
+	// history. sub_agent_list shows which sub-agents are live/running. Both
+	// registered only when delegation tools exist, and alongside them so
+	// plan-mode caching (subAgentToolNames) keeps them in lockstep.
+	if len(cfg.SubAgents) > 0 {
+		rt.tools = append(rt.tools, newSendTool(deps.SubAgentRegistry))
+		rt.tools = append(rt.tools, newListTool(deps.SubAgentRegistry))
 	}
 	if deps.Context != nil {
 		rt.context = deps.Context
@@ -195,6 +232,13 @@ func New(cfg *agent.Agent, deps Deps) *Runtime {
 
 // Config returns the agent configuration backing this runtime.
 func (rt *Runtime) Config() *agent.Agent { return rt.cfg }
+
+// SkillProvider returns the session's skill provider (nil if none).
+func (rt *Runtime) SkillProvider() skill.Provider {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	return rt.deps.SkillProvider
+}
 
 // Model returns the resolved model for the current run (session override
 // wins); nil until run() resolves it.
@@ -307,10 +351,17 @@ func (rt *Runtime) decisionObserver() hwcloud.DecisionObserver {
 	return nil
 }
 
-// allowAllPolicy is the no-approver policy: every call executes.
+// allowAllPolicy is the no-approver policy: every call executes, EXCEPT
+// calls with a non-empty risk_note — those are denied (fail-closed) because
+// there is no human to approve them. This prevents destructive commands
+// (rm -rf, terraform apply) from silently executing in modes without an
+// interactive approver (REST, CLI one-shot).
 type allowAllPolicy struct{}
 
-func (allowAllPolicy) Evaluate(context.Context, hwcloud.ToolCall, hwcloud.FunctionDefinition, hwcloud.Session) (governance.Decision, error) {
+func (allowAllPolicy) Evaluate(_ context.Context, call hwcloud.ToolCall, _ hwcloud.FunctionDefinition, _ hwcloud.Session) (governance.Decision, error) {
+	if governance.HasRiskNote(call) {
+		return governance.Decision{Action: governance.Deny, Reason: "risk_note present and no approver configured — destructive command requires approval"}, nil
+	}
 	return governance.Decision{Action: governance.Allow, Reason: "no approver configured"}, nil
 }
 
@@ -381,6 +432,7 @@ func (rt *Runtime) RunStreamWithPrefix(ctx context.Context, session hwcloud.Sess
 	ch := make(chan hwcloud.StreamEvent, 16)
 	go func() {
 		defer close(ch)
+		defer recoverStreamPanic(ch)
 		if !rt.hasConfigModel() && session.Model == nil {
 			ch <- hwcloud.StreamEvent{Type: hwcloud.StreamError, Error: errNoModel}
 			return
@@ -405,6 +457,7 @@ func (rt *Runtime) RunGoalStream(ctx context.Context, session hwcloud.Session, g
 	ch := make(chan hwcloud.StreamEvent, 16)
 	go func() {
 		defer close(ch)
+		defer recoverStreamPanic(ch)
 		if !rt.hasConfigModel() && session.Model == nil {
 			ch <- hwcloud.StreamEvent{Type: hwcloud.StreamError, Error: errNoModel}
 			return
@@ -414,6 +467,40 @@ func (rt *Runtime) RunGoalStream(ctx context.Context, session hwcloud.Session, g
 		sub.run(ctx, session, nil, hwcloud.UserMessage(goal), ch)
 	}()
 	return ch
+}
+
+// recoverStreamPanic catches a panic in the RunStream/RunGoalStream
+// goroutine and emits it as a StreamError before close(ch) fires. Without
+// this, a panic in run() (prompt build, model call, guard, commit) crashes
+// the entire process — the deferred close(ch) runs but the panic propagates
+// past it. Tool-execution panics are already caught by execution/handle.go;
+// this covers the rest of the run() pipeline.
+func recoverStreamPanic(ch chan<- hwcloud.StreamEvent) {
+	if rec := recover(); rec != nil {
+		var msg string
+		switch v := rec.(type) {
+		case error:
+			msg = v.Error()
+		case string:
+			msg = v
+		default:
+			msg = fmt.Sprintf("%v", rec)
+		}
+		slog.Error("runtime panic recovered", "error", msg)
+		// Use a short-timeout context, not context.Background(): the
+		// original ctx may be cancelled (panic could stem from that), but
+		// Background never cancels — if ch is full (buffer 16) and the
+		// consumer has stopped reading, Background blocks forever,
+		// preventing close(ch) and leaking the goroutine. 5s gives the
+		// consumer time to drain; if it's stuck, we drop the event and
+		// let close(ch) proceed so the caller sees the stream end.
+		sendCtx, sendCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		chSend(sendCtx, ch, hwcloud.StreamEvent{
+			Type:  hwcloud.StreamError,
+			Error: fmt.Errorf("runtime panic: %s", msg),
+		})
+		sendCancel()
+	}
 }
 
 // hasConfigModel reports whether the config carries a model, under mu

@@ -7,8 +7,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/google/uuid"
 	hwcloud "github.com/Cloud-Developer-Department/hwcloud"
+	"github.com/google/uuid"
 )
 
 // ── Handoff ──
@@ -64,7 +64,7 @@ type TeamContext struct {
 	ForceFinal     bool                         // if true, agent must produce final answer
 	RecordHandoff  func(target, message string) // callback to record a handoff
 	TeamPrompt     string                       // "## Team Context" block produced by buildTeamPrompt
-	HandoffTools   []hwcloud.Tool             // transfer_to_* tools to inject
+	HandoffTools   []hwcloud.Tool               // transfer_to_* tools to inject
 }
 
 // AgentType classifies an agent for UI display and capability checks.
@@ -308,11 +308,11 @@ func (t *Team) collectObserverNotifications() []observerNotification {
 
 // TeamResult holds the output of a Team.Run call.
 type TeamResult struct {
-	FinalOutput  string          // last agent's final text output
-	HandoffChain []HandoffEntry  // all handoffs that occurred
-	TotalTurns   int             // total model calls across all agents
-	Usage        hwcloud.Usage // total token usage
-	RunID        string          // #1: the team-level run ID; joins all child agent RunResults via their ParentRunID
+	FinalOutput  string         // last agent's final text output
+	HandoffChain []HandoffEntry // all handoffs that occurred
+	TotalTurns   int            // total model calls across all agents
+	Usage        hwcloud.Usage  // total token usage
+	RunID        string         // #1: the team-level run ID; joins all child agent RunResults via their ParentRunID
 }
 
 // Run executes the team on a user input. It routes to the first agent, then
@@ -347,11 +347,11 @@ const (
 // TeamEvent is emitted by Team.RunStream.
 type TeamEvent struct {
 	Type       TeamEventType
-	Agent      string              // current agent name
-	Target     string              // handoff target agent (handoff)
-	Text       string              // text_delta, tool_result content
-	ToolCallID string              // tool_result, tool_progress (matches tool_call.id)
-	Message    string              // handoff message (handoff)
+	Agent      string            // current agent name
+	Target     string            // handoff target agent (handoff)
+	Text       string            // text_delta, tool_result content
+	ToolCallID string            // tool_result, tool_progress (matches tool_call.id)
+	Message    string            // handoff message (handoff)
 	ToolCall   *hwcloud.ToolCall // tool_call
 	Result     *TeamResult
 	Error      error

@@ -10,8 +10,8 @@
 package mcp
 
 import (
-	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 	hwcloud "github.com/Cloud-Developer-Department/hwcloud"
+	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // ToMCPTool converts an hwcloud FunctionDefinition to an MCP Tool.

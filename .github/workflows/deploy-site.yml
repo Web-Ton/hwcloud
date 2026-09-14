@@ -3,7 +3,7 @@ name: Deploy site to GitHub Pages
 on:
   push:
     branches:
-      - master
+      - main
     paths:
       # 只在站点内容/本 workflow 变更时触发，避免 Go-only 提交白白跑 CI。
       - "site/**"

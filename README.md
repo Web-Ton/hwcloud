@@ -1,60 +1,35 @@
-# hwcloud
+<div align="center">
+  <img src="docs/logo.svg" alt="hwcloud" width="320">
 
-> [中文](README.zh.md) | [Architecture](DESIGN.md) | [架构 (中文)](DESIGN.zh.md)
+  An AI agent runtime kernel in Go — pluggable, sandboxed, ACP-native.
 
-A fully pluggable, multi-agent AI agent framework in Go.
+  [![CI](https://github.com/Cloud-Developer-Department/hwcloud/actions/workflows/ci.yml/badge.svg)](https://github.com/Cloud-Developer-Department/hwcloud/actions/workflows/ci.yml)
+  [![Go Reference](https://pkg.go.dev/badge/github.com/Cloud-Developer-Department/hwcloud.svg)](https://pkg.go.dev/github.com/Cloud-Developer-Department/hwcloud)
+  [![Go Report Card](https://goreportcard.com/badge/github.com/Cloud-Developer-Department/hwcloud)](https://goreportcard.com/report/github.com/Cloud-Developer-Department/hwcloud)
+  [![GitHub Stars](https://img.shields.io/github/stars/Cloud-Developer-Department/hwcloud?style=social)](https://github.com/Cloud-Developer-Department/hwcloud/stargazers)
+  [![GitHub Discussions](https://img.shields.io/github/discussions/Cloud-Developer-Department/hwcloud)](https://github.com/Cloud-Developer-Department/hwcloud/discussions)
+  [![GitHub PRs](https://img.shields.io/github/issues-pr/Cloud-Developer-Department/hwcloud)](https://github.com/Cloud-Developer-Department/hwcloud/pulls)
+  [![License](https://img.shields.io/github/license/Cloud-Developer-Department/hwcloud)](LICENSE)
 
-## Features
+  [中文](README.zh.md) · [Architecture](DESIGN.md) · [架构 (中文)](DESIGN.zh.md)
 
-- **Pluggable architecture** — every component is an interface: Model, Memory, Tools, Guards, Approver, Hooks, Observer
-- **ACP v1 protocol** — full Agent Client Protocol implementation over stdio (JSON-RPC 2.0). Use any ACP-compatible client (VSCode extension, Zed, etc.)
-- **Plan mode** — `plan_create`/`plan_update` tools let the agent decompose complex tasks into structured steps with live progress tracking
-- **Multi-agent team** — agents hand off tasks via `transfer_to_*` tools; each agent has independent memory, tools, and guard
-- **Multi-agent orchestration** — LLM-driven DAG decomposition, parallel execution, and auto-replan via `orchestrate/`
-- **Streaming SSE** — real-time token-by-token output, reasoning display, tool call cards
-- **Structured tool results** — `ToolResult` carries content/JSON/error/truncation; oversized output spills to disk automatically (line-wrapped, read/grep-friendly) instead of flooding the model context
-- **Approval policy engine** — layered chain (rules → safety → approval memory → human) with argument editing and persistent "always allow" decisions
-- **Self-evolution** — LLM extractor turns finished runs into durable knowledge, recalled into later sessions
-- **Three-layer memory** — Working (token-driven), Compressed (LLM incremental summary via `summarizer/`), Archive (vector/keyword searchable, never deleted); all three are provider-pluggable, including a remote OpenViking context database
-- **Sandbox** — native OS-level confinement (Linux bwrap, macOS Seatbelt) for shell, file, and network operations
-- **WASM plugins** — agent-level: `agent:tools` and `agent:observers` plug into the tool/observer pipeline. CLI-level: `cli:settings`, `cli:commands`, `cli:observers`, `cli:http` for settings injection, command extension, lifecycle monitoring, and custom HTTP routes. Any plugin can declare cron-scheduled jobs.
-- **Static context profiles** — `AGENTS.md` (working rules) and `SOUL.md` (persona & limits) with user-level and project-level resolution
-- **Slash commands** — built-in `/help`, `/mode`, `/model`, `/compact`, `/context`, `/cwd`, `/clear`, `/rename`, `/sessions`, extensible via `slash/` registry
-- **Full CLI** — `hwcloud` with cobra commands, config-driven models, keyring secrets, WASM plugin runtime
-- **IM channels** — Feishu/Lark (WebSocket, card-based streaming output with markdown and tool call cards, one-click QR setup, inline approval buttons, /clear and /mode commands), personal WeChat (Tencent ilinkai channel, QR login with pairing code, /clear command), and WeCom 企业微信 (official long connection, native streaming replies, QR robot auto-creation, /clear command)
-- **RunHooks with state** — start/end callbacks share opaque state; OTEL spans nest, slog logs duration
-- **Dynamic context** — session-level plan status and mode injected into every prompt turn
+  If you find hwcloud useful, give it a ⭐ on GitHub!
+</div>
 
 ## Quick Start
 
+**Prerequisites:** Go 1.26.4+ and an OpenAI-compatible API key.
+
 ```bash
-# Build CLI
-go build -o hwcloud ./cmd/cli/
+# Build (set HWCLOUD_BINARY_NAME to customize the binary identity)
+./build.sh
+# or: HWCLOUD_BINARY_NAME=myagent ./build.sh
 
-# Show version
-./hwcloud -v
-
-# ACP mode (stdio — for VSCode/Zed ACP plugins)
+# ACP mode — connect from a VSCode/Zed ACP plugin
 ./hwcloud serve --acp
 
-# REST mode (HTTP + SSE)
-./hwcloud serve --port 8080
-
-# One-shot chat with streaming output
-./hwcloud run "Hello, introduce yourself briefly"
-
-# Enable OS-native sandbox for shell commands
-./hwcloud serve --sandbox --port 8080
-
-# Toggle capabilities on/off (defaults: memory/summarizer/skills/mcp/embedder on, guard/approver off)
-./hwcloud serve --guard on --approver on
-
-# Suppress all log output
-./hwcloud serve -q --port 8080
-
-# Manage secrets in the system keyring
-./hwcloud keyring set mykey keyvalue
-./hwcloud keyring get mykey
+# TUI mode — interactive chat in the terminal
+./hwcloud tui
 ```
 
 ### Configuration
@@ -69,7 +44,7 @@ Create `~/.hwcloud/settings.json` (the `hwcloud` leaf is `version.Name`, default
       "api_key": "sk-...",
       "models": ["gpt-4o"]
     }
-  },
+  }
 }
 ```
 
@@ -97,8 +72,6 @@ export BOCHA_API_KEY=<your-key>   # get one at https://open.bochaai.com
 
 Connect your agent to Feishu (Lark) so users can chat with it in IM — group chats, private chats, cards with markdown rendering, and real-time streaming output.
 
-<img src=".github/images/feishu-bot-effect.jpg" alt="Feishu bot in action" width="750" />
-
 **First-time setup (no credentials needed):**
 
 ```bash
@@ -106,8 +79,6 @@ Connect your agent to Feishu (Lark) so users can chat with it in IM — group ch
 ```
 
 A QR code will appear in your terminal. Open Feishu on your phone, scan it, and confirm the app creation. The SDK automatically provisions a bot app with the correct permissions (`im:message`, `im:message:send_as_bot`, `im.message.receive_v1` event, `card.action.trigger` for approval/mode button callbacks) and saves the credentials locally.
-
-![First login - scan QR code](.github/images/feishu-first-login.jpg)
 
 **If you already have an app, configure it in `settings.json`:**
 
@@ -133,15 +104,12 @@ Then run with the flag to enable the channel:
 
 The `--channel` flag is always required to start the bot — settings.json alone won't auto-start it. If your credentials are in settings.json, the setup step is skipped automatically.
 
-![Subsequent login - start with credentials](.github/images/feishu-subsequent-login.jpg)
-
 **Where credentials are stored:**
 
-| Priority | Source | When to use |
-|----------|--------|-------------|
-| 1 | `settings.json` → `channels.feishu` | You have the app ID and secret |
-| 2 | settings.json `channels.feishu` | Auto-saved after QR registration (settings is the single credential source) |
-| 3 | QR code registration | First time, no credentials at all |
+| State | Source | When |
+|-------|--------|------|
+| Credentials present | `settings.json` → `channels.feishu` | You have the app ID and secret (manual config or auto-saved from prior QR registration) |
+| No credentials | QR code registration | First time, no credentials at all |
 
 **Combine with other modes:**
 
@@ -155,7 +123,7 @@ The `--channel` flag is always required to start the bot — settings.json alone
 
 **Frontend control panel:**
 
-The Feishu connection is a **process-level daemon** — the frontend only triggers and observes; closing or refreshing the page never affects it. Serve exposes two endpoints:
+The Feishu connection is a **process-level daemon** — the frontend only triggers and observes; closing or refreshing the page never affects it. Serve exposes two endpoint groups (channel control + settings management):
 
 | Endpoint | Purpose |
 |----------|---------|
@@ -171,7 +139,7 @@ Configuration is separate from the connection: `PUT /api/settings/channels/feish
 
 **Single instance per config dir:** one Feishu app = one active WebSocket. The server holds a machine-level lock (`<config-dir>/channel/feishu/feishu.lock`) for the whole connection lifetime — a second `--channel feishu` instance fails fast instead of silently stealing events. The lock is released automatically by the kernel if the process dies. For production, run under systemd/Docker so the process (and its connection) is supervised.
 
-**Adding MCP tools (optional):**
+**Adding MCP tools (optional, applies to all modes):**
 
 ```json
 {
@@ -210,7 +178,7 @@ Feishu additionally supports `/mode` — switches between Manual and Auto execut
 
 | Mode | Behaviour |
 |------|-----------|
-| **Manual** (default) | Each non-readonly tool call shows an approval card with 同意/拒绝 buttons before executing |
+| **Manual** (default) | Each non-readonly tool call shows an approval card with Approve/Reject buttons before executing |
 | **Auto** | Tools execute immediately without human approval (higher risk) |
 
 `/mode` with no argument shows a mode-switch card with clickable buttons. `/mode auto` or `/mode manual` switches directly. The mode is per-chat (each group/private chat remembers its own setting).
@@ -221,11 +189,11 @@ The initial mode for new chats defaults to Manual; set `"default_mode": "auto"` 
 
 Each agent run renders as a single card that updates in place (debounced patches). The body interleaves segments in arrival order: thinking (collapsed panel) → text → tool call (collapsed panel, titled with tool name + status ✓/✗) → text → … When a run completes, the card switches to an expanded state. Long runs that exceed the 28KB card limit auto-rotate: the old card folds to a collapsed "done" state and a fresh card starts with the last few blocks.
 
-Approval requests in Manual mode embed their buttons directly in the run card (no separate approval card). When the user clicks 同意/拒绝, the card updates in-place and the agent continues or stops.
+Approval requests in Manual mode embed their buttons directly in the run card (no separate approval card). When the user clicks Approve/Reject, the card updates in-place and the agent continues or stops.
 
 ### WeChat (personal) Integration
 
-Connect your agent to your **personal WeChat** via Tencent's official ilinkai channel (`ilinkai.weixin.qq.com`) — no SDK, plain HTTP long-poll. The agent replies once per message (WeChat has no streaming/message-edit API; a "对方正在输入" typing indicator shows while the agent works). Media markers (`[file: /path]` in reply text) are uploaded and sent as file/image messages.
+Connect your agent to your **personal WeChat** via Tencent's official ilinkai channel (`ilinkai.weixin.qq.com`) — no SDK, plain HTTP long-poll. The agent replies once per message (WeChat has no streaming/message-edit API; a "typing…" typing indicator shows while the agent works). Media markers (`[file: /path]` in reply text) are uploaded and sent as file/image messages.
 
 **First-time setup (scan to create the bot):**
 
@@ -248,7 +216,7 @@ A QR code appears in the terminal — scan it with WeChat and confirm. The bot i
 
 A session that expires server-side (`errcode -14`) clears the credentials automatically — the next connect re-runs the QR login.
 
-### WeCom (企业微信) Integration
+### WeCom Integration
 
 Connect your agent to a **WeCom smart robot** via the official long-connection API (`wss://openws.work.weixin.qq.com`) — the richest of the three channels: **native streaming replies** (one message that grows in place), group chats with @-mentions, and voice already transcribed to text.
 
@@ -258,7 +226,7 @@ Connect your agent to a **WeCom smart robot** via the official long-connection A
 ./hwcloud serve --channel wecom
 ```
 
-A QR code appears — scan it with the WeCom app; the robot is created automatically and the BotID/Secret are saved to settings.json. Alternatively, create the robot manually in the WeCom admin console (安全与管理 → 管理工具 → 智能机器人 → API 模式 → 长连接) and configure it via the settings endpoint:
+A QR code appears — scan it with the WeCom app; the robot is created automatically and the BotID/Secret are saved to settings.json. Alternatively, create the robot manually in the WeCom admin console (Security & Management → Management Tools → Smart Robot → API Mode → Long Connection; 安全与管理 → 管理工具 → 智能机器人 → API 模式 → 长连接) and configure it via the settings endpoint:
 
 ```json
 {
@@ -307,6 +275,27 @@ To keep a specific domain on local storage while using OpenViking for the rest:
 
 `context_providers` accepts `"builtin"` or `"openviking"` for each of `memory`, `skill`, `resource`. Empty = follow the endpoint default.
 
+## Features
+
+- **Pluggable architecture** — every component is an interface: Model, Memory, Tools, Guards, Approver, Hooks, Observer
+- **ACP v1 protocol** — full Agent Client Protocol implementation over stdio (JSON-RPC 2.0). Use any ACP-compatible client (VSCode extension, Zed, etc.)
+- **Plan mode** — `plan_create`/`plan_update` tools let the agent decompose complex tasks into structured steps with live progress tracking
+- **Multi-agent team** — agents hand off tasks via `transfer_to_*` tools; each agent has independent memory, tools, and guard
+- **Multi-agent orchestration** — LLM-driven DAG decomposition, parallel execution, and auto-replan via `orchestrate/`
+- **Streaming SSE** — real-time token-by-token output, reasoning display, tool call cards
+- **Structured tool results** — `ToolResult` carries content/JSON/error/truncation; oversized output spills to disk automatically (line-wrapped, read/grep-friendly) instead of flooding the model context
+- **Approval policy engine** — layered chain (rules → safety → approval memory → human) with argument editing and persistent "always allow" decisions
+- **Self-evolution** — LLM extractor turns finished runs into durable knowledge, recalled into later sessions
+- **Three-layer memory** — Working (token-driven), Compressed (LLM incremental summary via `summarizer/`), Archive (vector/keyword searchable, never deleted); all three are provider-pluggable, including a remote OpenViking context database
+- **Sandbox** — native OS-level confinement (Linux bwrap, macOS Seatbelt) for shell, file, and network operations
+- **WASM plugins** — agent-level: `agent:tools` and `agent:observers` plug into the tool/observer pipeline. CLI-level: `cli:settings`, `cli:commands`, `cli:observers`, `cli:http` for settings injection, command extension, lifecycle monitoring, and custom HTTP routes. Any plugin can declare cron-scheduled jobs.
+- **Static context profiles** — `AGENTS.md` (working rules) and `SOUL.md` (persona & limits) with user-level and project-level resolution
+- **Slash commands** — built-in `/help`, `/mode`, `/model`, `/compact`, `/cwd`, `/clear`, `/rename`, `/sessions`, extensible via `slash/` registry
+- **Full CLI** — `hwcloud` with cobra commands, config-driven models, keyring secrets, WASM plugin runtime
+- **IM channels** — Feishu/Lark (WebSocket, card-based streaming output with markdown and tool call cards, one-click QR setup, inline approval buttons, /clear and /mode commands), personal WeChat (Tencent ilinkai channel, QR login with pairing code, /clear command), and WeCom (official long connection, native streaming replies, QR robot auto-creation, /clear command)
+- **RunHooks with state** — start/end callbacks share opaque state; OTEL spans nest, slog logs duration
+- **Dynamic context** — session-level plan status and mode injected into every prompt turn
+
 ## Architecture
 
 ```
@@ -328,6 +317,9 @@ To keep a specific domain on local storage while using OpenViking for the rest:
 │  └─ eventbus    (audit events)               │
 └──────────────────────────────────────────────┘
 ```
+
+> **Pipeline stages (8 nodes):** memory → prompt → guard → model → guard → policy → tools → store.
+> The 6 boxes above are the kernel sub-components that implement these stages.
 
 The `agent.Agent` is pure configuration (model, prompts, guards, sub-agents);
 everything executable lives in the runtime and its dependencies — tools,
@@ -528,15 +520,15 @@ Full examples: `examples/plugin/`. Rust SDK: `plugin/pdk/rust/`.
 | `examples/observer/` | Pipeline observer |
 | `examples/delegate/` | Agent as tool delegation |
 | `examples/sandbox/` | Native sandbox tools |
-| `examples/plugin/` | WASM tool, observer, and scheduled-job plugins |
+| `examples/plugin/` | WASM tool, observer, scheduled-job, and model-switch plugins |
 | `examples/skill/` | On-demand skill loading |
 | `examples/acp/` | ACP agent protocol (server + client) |
 | `examples/artifact/` | Result policy — large tool results spill to disk |
 | `examples/browser-agent/` | Browser agent via Playwright MCP |
 | `examples/mcp-client/` | MCP client demo (IaC pipeline) |
-| `examples/frontend/` | Vue.js frontend control panel (channel status, settings, QR rendering) |
+| `site/` | Next.js + React frontend control panel (channel status, settings, QR rendering) |
 | `cmd/cli/` | Full-featured CLI with WASM plugin runtime |
-| `cmd/tui/` | TUI chat client (bubbletea v2, streaming, human-in-the-loop approval) |
+| `cmd/cli/tui/` | TUI chat client (bubbletea v2, streaming, human-in-the-loop approval) |
 
 ## Packages
 
@@ -578,8 +570,8 @@ Full examples: `examples/plugin/`. Rust SDK: `plugin/pdk/rust/`.
 | `hooks/otel/` | OpenTelemetry hooks |
 | `hooks/slog/` | Structured logging hooks |
 | `hooks/redact/` | Masks sensitive env-var values in tool results |
-| `tool/` | Built-in tools (shell, read, write, ls, grep, edit, websearch, webfetch, ACP fs, ACP terminal) |
-| `channel/` | IM platform adapters — Feishu (WebSocket, card rendering), WeChat (ilinkai HTTP), WeCom (长连接 streaming) |
+| `tool/` | Built-in tools (shell, read, write, edit, ls, grep, websearch, webfetch, browser, office, ACP fs, ACP terminal) |
+| `channel/` | IM platform adapters — Feishu (WebSocket, card rendering), WeChat (ilinkai HTTP), WeCom (long-connection streaming) |
 | `keyring/` | System keychain wrapper (Linux Secret Service/kernel keyring, macOS Keychain, Windows Credential Manager) |
 | `process/` | Background shell-process lifecycle management (track, persist output, kill across turns) |
 | `scheduler/` | Cron-based job scheduling for WASM plugin scheduled tasks |
@@ -587,5 +579,8 @@ Full examples: `examples/plugin/`. Rust SDK: `plugin/pdk/rust/`.
 | `iac/` | Terraform wrapper — binary install/mirror management, init/plan/apply/destroy |
 | `version/` | Build-time binary identity (name + version via ldflags) |
 | `cmd/cli/` | CLI runtime, WASM host, REST/ACP server, settings, channel managers |
-| `cmd/tui/` | TUI chat client (bubbletea v2) |
+| `cmd/cli/tui/` | TUI chat client (bubbletea v2) |
 | `cmd/mcp/` | IaC MCP server — cloud deployment tools (HuaweiCloud, Aliyun) over MCP stdio |
+| `skills/` | Built-in embedded skills (`powerpoint`, `skill-creator`) + `embed.go` for go:embed |
+| `third_party/` | Vendored model assets (unused — embedding is external-provider-only; pending removal) |
+| `site/` | Next.js + React frontend control panel (channel status, settings, QR rendering) |

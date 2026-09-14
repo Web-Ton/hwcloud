@@ -10,7 +10,9 @@ import (
 	"time"
 
 	hwcloud "github.com/Cloud-Developer-Department/hwcloud"
+	"github.com/Cloud-Developer-Department/hwcloud/acp"
 	"github.com/Cloud-Developer-Department/hwcloud/agent"
+	"github.com/Cloud-Developer-Department/hwcloud/guard/llm"
 	"github.com/Cloud-Developer-Department/hwcloud/keyring"
 	"github.com/Cloud-Developer-Department/hwcloud/rest"
 	"github.com/Cloud-Developer-Department/hwcloud/sandbox/native"
@@ -31,13 +33,14 @@ import (
 // ── REST server ──
 
 // RunREST starts the REST API server (HTTP + SSE).
-func RunREST(ctx context.Context, cfg *config.Config, caps config.Capabilities) error {
-	models, modelInfos := buildModels(cfg.Provider)
-	m := firstModel(models)
+func RunREST(ctx context.Context, cfg *config.Config) error {
+	caps := cfg.Capabilities
+	_, modelInfos := buildModels(cfg.Provider)
+	m := resolveModel(cfg.Model, modelInfos)
 
 	workDir, _ := os.Getwd()
 	sb, err := native.NewWithPolicy(workDir, sandboxPolicy(cfg.Sandbox))
-	restToolList := []string{"shell", "read", "write", "edit", "ls", "grep", "websearch", "webfetch"}
+	restToolList := []string{"shell", "read", "write", "edit", "ls", "grep", "websearch", "webfetch", "settings"}
 	if caps.OnBrowser() {
 		restToolList = append(restToolList, "browser")
 	}
@@ -67,18 +70,25 @@ func RunREST(ctx context.Context, cfg *config.Config, caps config.Capabilities) 
 	opts := []agent.Option{
 		agent.WithModel(m),
 		agent.WithSystemPrompts(resolveProfiles("")...),
-		agent.WithMaxTurns(100),
+		agent.WithMaxTurns(500),
 	}
-	opts, skillProvider := buildOpts(opts, caps, m)
+	// REST is single-process with no model hot-reload, so a static guard
+	// is correct — no dynamic lookup needed.
+	if caps.OnGuard() && m != nil {
+		g := llm.New(m)
+		opts = append(opts, agent.WithInputGuard(g))
+		opts = append(opts, agent.WithOutputGuard(g.Output()))
+	}
+	opts, skillProvider := buildOpts(opts, caps)
 	agentCfg := agent.New(version.Name, opts...)
 
-	tracer, telemetryShutdown, err := setupTelemetry(ctx, *cfg)
+	holder, _, telemetryShutdown, err := setupTelemetry(ctx, *cfg)
 	if err != nil {
 		return fmt.Errorf("telemetry init: %w", err)
 	}
 	defer telemetryShutdown()
 
-	deps := buildRuntimeDeps(caps, cfg.Sensitive, tracer)
+	deps := buildRuntimeDeps(caps, cfg.Sensitive, holder)
 	deps.Tools = tools
 	deps.SkillProvider = skillProvider
 	if caps.OnMemory() {
@@ -88,18 +98,26 @@ func RunREST(ctx context.Context, cfg *config.Config, caps config.Capabilities) 
 	}
 
 	if caps.OnSummarizer() && m != nil && caps.OnMemory() {
-		ms.WithSummarizer(summarizer.New(m).WithMaxTokens(agentCfg.MaxCompressedTokens))
+		sumz := summarizer.New(m).WithMaxTokens(agentCfg.MaxCompressedTokens)
+		ms.WithSummarizer(sumz)
+		deps.Summarizer = sumz
 	}
 
-	if err := applyContextProviders(cfg, &deps); err != nil {
+	providerCleanup, err := applyContextProviders(cfg, &deps)
+	if err != nil {
 		return err
 	}
+	defer func() {
+		if providerCleanup != nil {
+			providerCleanup()
+		}
+	}()
 	// The extractor captures the MemoryProvider it writes to — build it
 	// AFTER applyContextProviders so the effective provider is used.
 	// Building it earlier would fork writes to the local sqlite store
 	// while Recall reads the OpenViking index (silent knowledge loss).
 	if caps.OnMemory() && m != nil && deps.MemoryProvider != nil {
-		deps.Extractor = ctxpkg.NewAsyncExtractor(ctxpkg.NewLLMExtractor(m, deps.MemoryProvider))
+		deps.Extractor = ctxpkg.NewAsyncExtractor(ctxpkg.NewLLMExtractor(func() hwcloud.Model { return m }, deps.MemoryProvider))
 	}
 	handler := rest.NewHandler(agentCfg, deps).
 		WithSessionStore(store).
@@ -165,7 +183,7 @@ func RunREST(ctx context.Context, cfg *config.Config, caps config.Capabilities) 
 		w.Write([]byte(`{"status":"ok"}`))
 	})
 
-	addr := fmt.Sprintf(":%d", cfg.Server.Port)
+	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
 	// ReadHeaderTimeout guards the slow-header DoS (a client that never
 	// finishes sending headers holds a connection); body reads are
 	// bounded per-handler (see the cli:http dispatcher). SSE endpoints
@@ -184,6 +202,33 @@ func RunREST(ctx context.Context, cfg *config.Config, caps config.Capabilities) 
 		defer cancel()
 		srv.Shutdown(shutdownCtx)
 	}()
+
+	// Register the settings watcher for the reload action. REST mode has
+	// no AgentServer (srv=nil) so model registry updates are skipped.
+	// fsnotify auto-reload is disabled — see acp.go for rationale.
+	activeWatcher.Store(&settingsWatcher{
+		cfgPath:  config.Path(),
+		prev:     cfg,
+		holder:   holder,
+		shutdown: telemetryShutdown,
+		srv:      nil,
+	})
+	// Set the shared reload function for the settings tool's reload action.
+	// REST has no AgentServer so slash commands are unavailable, but the
+	// settings tool (if wired via capabilities) still uses this.
+	reloadFn := func(ctx context.Context) acp.ReloadResult {
+		sw := activeWatcher.Load()
+		if sw == nil {
+			return acp.ReloadResult{ParseError: "no settings watcher configured"}
+		}
+		r := sw.reload(ctx)
+		return acp.ReloadResult{
+			Applied:    r.Applied,
+			Violations: r.Violations,
+			ParseError: r.ParseError,
+		}
+	}
+	settingsReloadFn.Store(&reloadFn)
 
 	slog.Info("REST server listening", "addr", addr)
 	err = srv.ListenAndServe()

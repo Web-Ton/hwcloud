@@ -19,11 +19,11 @@ const (
 
 // MemoryEntry is one piece of remembered context injected into the prompt.
 type MemoryEntry struct {
-	Kind    MemoryKind  `json:"kind"`
-	Content string      `json:"content"`
-	Topic   string      `json:"topic,omitempty"` // upsert key (for the extractor's update classification)
-	Path    string      `json:"path,omitempty"`  // source file, if any
-	Score   float64     `json:"score,omitempty"`
+	Kind    MemoryKind `json:"kind"`
+	Content string     `json:"content"`
+	Topic   string     `json:"topic,omitempty"` // upsert key (for the extractor's update classification)
+	Path    string     `json:"path,omitempty"`  // source file, if any
+	Score   float64    `json:"score,omitempty"`
 }
 
 // AgentContext is the assembled input the agent sees — the projection of
@@ -38,7 +38,7 @@ type MemoryEntry struct {
 // what the tool result already carries.
 type AgentContext struct {
 	Messages  []hwcloud.Message   `json:"messages"`
-	Memories  []MemoryEntry         `json:"memories,omitempty"`
+	Memories  []MemoryEntry       `json:"memories,omitempty"`
 	Skills    []hwcloud.SkillInfo `json:"skills,omitempty"`
-	Resources []resource.Resource   `json:"resources,omitempty"`
+	Resources []resource.Resource `json:"resources,omitempty"`
 }

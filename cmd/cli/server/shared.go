@@ -2,19 +2,23 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	hwcloud "github.com/Cloud-Developer-Department/hwcloud"
+	"github.com/Cloud-Developer-Department/hwcloud/acp"
 	"github.com/Cloud-Developer-Department/hwcloud/agent"
 	ctxpkg "github.com/Cloud-Developer-Department/hwcloud/context"
 	openaiembed "github.com/Cloud-Developer-Department/hwcloud/embedder/openai"
-	"github.com/Cloud-Developer-Department/hwcloud/guard/llm"
-	"go.opentelemetry.io/otel/trace"
 	otelhooks "github.com/Cloud-Developer-Department/hwcloud/hooks/otel"
 	redacthook "github.com/Cloud-Developer-Department/hwcloud/hooks/redact"
 	sloghooks "github.com/Cloud-Developer-Department/hwcloud/hooks/slog"
@@ -82,11 +86,20 @@ func buildMemory(emb config.EmbeddingConfig, embedder bool) (*sessionsqlite.Mess
 	}, nil
 }
 
-// buildModels creates OpenAI model instances from config providers.
+// buildModels creates OpenAI model instances from config providers. Provider
+// keys are sorted so the model order is deterministic (callers that fall back
+// to "the first model" — resolveModel, NewAgentServer's default — pick the
+// same one every run, not a random map iteration order).
 func buildModels(providers map[string]config.ProviderConfig) ([]hwcloud.Model, []modelReg) {
+	pids := make([]string, 0, len(providers))
+	for pid := range providers {
+		pids = append(pids, pid)
+	}
+	sort.Strings(pids)
 	var models []hwcloud.Model
 	var infos []modelReg
-	for pid, p := range providers {
+	for _, pid := range pids {
+		p := providers[pid]
 		for _, mc := range p.Models {
 			apiKey := p.APIKey
 			if apiKey == "" {
@@ -101,15 +114,16 @@ func buildModels(providers map[string]config.ProviderConfig) ([]hwcloud.Model, [
 			}
 			models = append(models, m)
 			infos = append(infos, modelReg{
-				ID:                     mc.ID,
-				Provider:               pid,
-				Model:                  m,
-				APIKey:                 apiKey,
-				BaseURL:                p.BaseURL,
-				MaxOutputTokens:        mc.MaxOutputTokens,
-				InputCostPerToken:      mc.InputCostPerToken,
-				InputCacheCostPerToken: mc.InputCacheCostPerToken,
-				OutputCostPerToken:     mc.OutputCostPerToken,
+				ID:                       mc.ID,
+				Provider:                 pid,
+				Model:                    m,
+				APIKey:                   apiKey,
+				BaseURL:                  p.BaseURL,
+				MaxInputTokens:           mc.MaxInputTokens,
+				MaxOutputTokens:          mc.MaxOutputTokens,
+				InputCostPerMillion:      mc.InputCostPerMillion,
+				InputCacheCostPerMillion: mc.InputCacheCostPerMillion,
+				OutputCostPerMillion:     mc.OutputCostPerMillion,
 			})
 		}
 	}
@@ -117,21 +131,46 @@ func buildModels(providers map[string]config.ProviderConfig) ([]hwcloud.Model, [
 }
 
 type modelReg struct {
-	ID                     string
-	Provider               string
-	Model                  hwcloud.Model
-	APIKey                 string
-	BaseURL                string
-	MaxOutputTokens        int
-	InputCostPerToken      float64
-	InputCacheCostPerToken float64
-	OutputCostPerToken     float64
+	ID                       string
+	Provider                 string
+	Model                    hwcloud.Model
+	APIKey                   string
+	BaseURL                  string
+	MaxInputTokens           int
+	MaxOutputTokens          int
+	InputCostPerMillion      float64
+	InputCacheCostPerMillion float64
+	OutputCostPerMillion     float64
 }
 
-func firstModel(models []hwcloud.Model) hwcloud.Model {
-	for _, m := range models {
-		if m != nil {
-			return m
+// Key returns the registry key for this model: "<provider>/<id>" when a
+// provider is set, else just "<id>". This is the canonical key format used
+// by modelMap, RegisterModel, resolveModel, and reconfigureModels — keep
+// them consistent by routing through here.
+func (mi modelReg) Key() string {
+	if mi.Provider != "" {
+		return mi.Provider + "/" + mi.ID
+	}
+	return mi.ID
+}
+
+// resolveModel picks the model instance for REST/CLI (single-model modes).
+// settings "model" ("<provider>/<modelID>") wins when it matches a registered
+// model; otherwise the first configured model is used as a fallback. This
+// mirrors ACP's srv.SetDefaultModelID(cfg.Model) so all three entrypoints
+// honor the same settings.model preference instead of REST/CLI silently
+// picking a random map-iteration order.
+func resolveModel(cfgModel string, infos []modelReg) hwcloud.Model {
+	if cfgModel != "" {
+		for _, mi := range infos {
+			if mi.Key() == cfgModel {
+				return mi.Model
+			}
+		}
+	}
+	for _, mi := range infos {
+		if mi.Model != nil {
+			return mi.Model
 		}
 	}
 	return nil
@@ -143,15 +182,44 @@ func firstModel(models []hwcloud.Model) hwcloud.Model {
 // three domains to it by default — one address is enough. context_providers
 // remains as an opt-out escape hatch: an explicit "builtin" for a domain
 // keeps the local backend. No endpoint = fully local, no server required.
-func applyContextProviders(cfg *config.Config, deps *kernel.Deps) error {
-	cp := cfg.ContextProviders
+//
+// Returns a cleanup func that flushes context providers (e.g. OpenViking
+// session) on shutdown — commits any pending messages below the threshold.
+// nil when no provider needs cleanup (no endpoint configured).
+func applyContextProviders(cfg *config.Config, deps *kernel.Deps) (func(), error) {
 	if cfg.OpenViking.Endpoint == "" {
-		return nil
+		return nil, nil
 	}
-	client, err := openviking.NewClient(cfg.OpenViking.Endpoint, cfg.OpenViking.APIKey)
+	client, err := buildOVClient(cfg)
 	if err != nil {
-		return fmt.Errorf("openviking: %w", err)
+		return nil, err
 	}
+	wireOVProviders(cfg, client, deps)
+	return ovFlushCleanup(client), nil
+}
+
+// buildOVClient constructs an OpenViking client with session-reuse config
+// mapped from the settings-layer OVSessionConfig.
+func buildOVClient(cfg *config.Config) (*openviking.Client, error) {
+	s := cfg.OpenViking.Session
+	return openviking.NewClientWithSession(
+		cfg.OpenViking.Endpoint, cfg.OpenViking.APIKey,
+		openviking.SessionConfig{
+			SessionIDSeed:              configDir(),
+			CommitTokenThreshold:       s.CommitTokenThreshold,
+			CommitMessageThreshold:     s.CommitMessageThreshold,
+			MinCommitInterval:          time.Duration(s.MinCommitIntervalSeconds) * time.Second,
+			KeepRecentTurnCount:        s.KeepRecentTurnCount,
+			RetainedMessageTokenBudget: s.RetainedMessageTokenBudget,
+			MinRawTailSteps:            s.MinRawTailSteps,
+		},
+	)
+}
+
+// wireOVProviders switches each domain to OpenViking unless the operator
+// explicitly set "builtin" for that domain in context_providers.
+func wireOVProviders(cfg *config.Config, client *openviking.Client, deps *kernel.Deps) {
+	cp := cfg.ContextProviders
 	if cp.Memory != "builtin" {
 		deps.MemoryProvider = openviking.NewMemoryWithRecall(client, openviking.RecallConfig{
 			Quotas:   cfg.OpenViking.Recall.Quotas,
@@ -165,7 +233,18 @@ func applyContextProviders(cfg *config.Config, deps *kernel.Deps) error {
 	if cp.Resource != "builtin" {
 		deps.ResourceProvider = openviking.NewResource(client)
 	}
-	return nil
+}
+
+// ovFlushCleanup returns a shutdown func that flushes the OpenViking
+// session (commits any pending messages below the threshold).
+func ovFlushCleanup(client *openviking.Client) func() {
+	return func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := client.Flush(ctx); err != nil {
+			slog.Warn("openviking session flush failed", "error", err)
+		}
+	}
 }
 
 // sandboxPolicy translates the config-layer SandboxConfig into a
@@ -226,10 +305,25 @@ func buildTools(sandbox *native.Sandbox, workDir string, toolList []string) []hw
 		// Go) + pptx_write (Node.js PptxGenJS, embedded worker bundle).
 		tools = append(tools, opentool.NewOfficeTools(workDir)...)
 	}
+	if enabled["settings"] {
+		// Server-level config tool: read/modify settings.json atomically.
+		// Not cwd-scoped (settings.json is global), but built here so it
+		// follows the same capability-gated assembly as other tools.
+		// Classified Dangerous (not read-only) — settings.json carries
+		// apikeys/secrets, so even get/list routes through the approver.
+		tools = append(tools, newSettingsTool())
+	}
 	return tools
 }
 
 // ── Static context (AGENTS.md / SOUL.md) ──
+
+// builtinSystemPrompt is a non-overridable system prompt containing
+// built-in rules the model must follow regardless of user customization.
+// Injected BEFORE the user-overridable prompts (SOUL/SYSTEM/AGENTS) and
+// cannot be replaced by a .md file.
+const builtinSystemPrompt = `# Built-in Rules
+<system-reminder> tags wrap system events, not user messages. They are delivered asynchronously when something happens in the background (e.g. a sub-agent completed, settings were modified). A system event is not a request from the user to continue working — take the indicated action if needed, otherwise stop and wait for the user.`
 
 // methodologyAndRulesPrompt is the built-in default for AGENTS.md.
 // It defines working methodology and behavioral rules.
@@ -310,6 +404,7 @@ func configDir() string {
 // The prompts are returned in injection order: SOUL → SYSTEM → AGENTS.
 func resolveProfiles(cwd string) []string {
 	return []string{
+		builtinSystemPrompt, // non-overridable built-in rules
 		resolveProfileFile(cwd, "SOUL.md", personaAndLimitsPrompt),
 		resolveProfileFile(cwd, "SYSTEM.md", systemContextPrompt),
 		resolveProfileFile(cwd, "AGENTS.md", methodologyAndRulesPrompt),
@@ -345,29 +440,29 @@ func resolveProfileFile(cwd, filename, defaultText string) string {
 // ── Optional capability builders ──
 
 // openSkillProvider creates a file-system skill provider spanning the skill
-// directories that exist plus the embedded built-in skills (when built with
-// -tags embed). Roots are passed to fs.New in override order (user-level first,
-// project-level last), so skills in a later root override same-name skills
-// from an earlier root:
+// directories that exist plus the embedded built-in skills (bundled via
+// //go:embed, no build tag required). Roots are passed to fs.New in override
+// order (user-level first, project-level last), so skills in a later root
+// override same-name skills from an earlier root:
 //
 //  1. ~/.agents/skills            (user-level)
 //  2. <workspace>/.agents/skills  (project-level, overrides user-level)
-//  3. embedded built-in skills    (lowest priority, -tags embed only)
+//  3. embedded built-in skills    (lowest priority, always present)
 //
 // Directories that do not exist are skipped. Returns nil only when there are
 // no disk roots AND no embedded skills.
 func openSkillProvider() skill.Provider {
-	var roots []string
-	for _, dir := range skillDirs() {
-		if info, err := os.Stat(dir); err == nil && info.IsDir() {
-			roots = append(roots, dir)
+	var roots []fs.RootEntry
+	for _, re := range skillDirs() {
+		if info, err := os.Stat(re.Path); err == nil && info.IsDir() {
+			roots = append(roots, re)
 		}
 	}
 	embedFS := builtinskills.BuiltinFS()
 	if len(roots) == 0 && embedFS == nil {
 		return nil
 	}
-	loader := fs.New(roots...)
+	loader := fs.NewWithSources(roots...)
 	if embedFS != nil {
 		loader = loader.WithEmbedFS(embedFS)
 	}
@@ -375,11 +470,11 @@ func openSkillProvider() skill.Provider {
 }
 
 // skillDirs returns the skill directory candidates in override order:
-// user-level first (~/.agents/skills), project-level last
-// (<cwd>/.agents/skills, overrides user-level). When home equals cwd the
-// two resolve to the same path and only one entry is returned.
-func skillDirs() []string {
-	var dirs []string
+// user-level first (~/.agents/skills, type="global"), project-level last
+// (<cwd>/.agents/skills, type="project", overrides user-level). When home
+// equals cwd the two resolve to the same path and only one entry is returned.
+func skillDirs() []fs.RootEntry {
+	var dirs []fs.RootEntry
 	seen := make(map[string]struct{})
 
 	home, err := os.UserHomeDir()
@@ -387,7 +482,7 @@ func skillDirs() []string {
 		d := filepath.Join(home, ".agents", "skills")
 		if _, ok := seen[d]; !ok {
 			seen[d] = struct{}{}
-			dirs = append(dirs, d)
+			dirs = append(dirs, fs.RootEntry{Path: d, Type: "global"})
 		}
 	}
 
@@ -396,15 +491,10 @@ func skillDirs() []string {
 		d := filepath.Join(cwd, ".agents", "skills")
 		if _, ok := seen[d]; !ok {
 			seen[d] = struct{}{}
-			dirs = append(dirs, d)
+			dirs = append(dirs, fs.RootEntry{Path: d, Type: "project"})
 		}
 	}
 	return dirs
-}
-
-// buildGuard creates an LLM guard using the given model as judge.
-func buildGuard(model hwcloud.Model) *llm.Guard {
-	return llm.New(model)
 }
 
 // buildSlogHooks creates slog-based RunHooks (the lifecycle axis).
@@ -425,21 +515,167 @@ func buildSlogObserver() hwcloud.RunObserver {
 	return sloghooks.NewObserver(slog.Default())
 }
 
-// buildOpts appends capability-gated agent options (skills, guard) to opts
-// and returns the skill provider for the runtime deps. model is used by the
-// guard; it may be nil if no models are configured, in which case the guard
-// is skipped regardless of caps.
-func buildOpts(opts []agent.Option, caps config.Capabilities, model hwcloud.Model) ([]agent.Option, skill.Provider) {
+// buildOpts appends capability-gated agent options (skills, sub-agents) to
+// opts and returns the skill provider for the runtime deps. The guard is NOT
+// wired here — it is constructed by each entrypoint (RunACP/RunREST/RunCLI)
+// so it can resolve the judge model at the right scope: ACP uses the server's
+// dynamic lookup (after srv exists), REST/CLI use a static model closure.
+func buildOpts(opts []agent.Option, caps config.Capabilities) ([]agent.Option, skill.Provider) {
 	var sp skill.Provider
 	if caps.OnSkills() {
 		sp = openSkillProvider()
 	}
-	if caps.OnGuard() && model != nil {
-		g := buildGuard(model)
-		opts = append(opts, agent.WithInputGuard(g))
-		opts = append(opts, agent.WithOutputGuard(g.Output()))
-	}
+	// Three domain-agnostic sub-agents, split by information source
+	// (local/external) × intent (collect/inspect), not by business domain.
+	// filterChildTools narrows each child to its allowlist and additionally
+	// strips sub-agent recursion (a child cannot spawn another child).
+	// HumanApprover is nil in children (see child_registry.go), so read-only
+	// intent is enforced by prompt, not by an approval gate.
+	opts = append(opts, agent.WithSubAgents(
+		explorerSubAgent(),
+		researcherSubAgent(),
+		reviewerSubAgent(),
+	))
 	return opts, sp
+}
+
+// explorerSubAgent is the local-information collection sub-agent. It surveys,
+// extracts, and organizes content already present on disk — never modifying
+// anything. The model delegates a focused local investigation; the child runs
+// in an isolated context (no parent history) and reports back findings.
+func explorerSubAgent() agent.SubAgent {
+	return agent.SubAgent{
+		Name: "explorer",
+		Description: "Survey and organize LOCAL information — anything already present on disk. " +
+			"Delegate when the task spans multiple sources or requires synthesis across them. " +
+			"When unsure about scope, assess it first (e.g. list the area) — if it exceeds a handful of items, prefer delegation. " +
+			"For a single-item lookup, do it directly. " +
+			"Read-only.",
+		SystemPrompt: `You are a local-information collection sub-agent. Your job is to locate, gather, and organize information that already exists locally — never to modify anything.
+
+What to do:
+- Survey the local area, find relevant items, extract what matters, and synthesize a coherent picture.
+- Cite the location of every piece you report.
+- Quote minimally — enough to convey the point, not entire items.
+- Distinguish what you directly observed from what you inferred.
+
+Shell discipline (read-only intent — there is NO approval gate in sub-agents):
+- Run only commands that read or query — never commands that write, create, delete, install, or download.
+- When unsure whether a command mutates state: assume it does, and do not run it.
+
+Budget:
+- Narrow broad searches rather than processing every result.
+- For large items, read the relevant portion, not the whole thing.
+- If you cannot find the answer after a reasonable effort, report what you searched and where.
+
+Anti-patterns:
+- Do NOT write, edit, or create anything.
+- Do NOT dump entire items — quote only relevant portions.
+- Do NOT take over the reviewer's job (evaluate quality, find problems).
+- Do NOT take over the researcher's job (web research).
+- Do NOT speculate without evidence.`,
+		Tools:    []string{"read", "ls", "grep", "shell", "pptx_read", "excel_read", "word_read"},
+		MaxTurns: 100,
+	}
+}
+
+// researcherSubAgent is the external-information gathering sub-agent. It
+// searches the web, cross-verifies across sources, and synthesizes a grounded
+// summary with citations. Read-only intent.
+func researcherSubAgent() agent.SubAgent {
+	return agent.SubAgent{
+		Name: "researcher",
+		Description: "Research and synthesize EXTERNAL information from the web. " +
+			"Delegate when the task needs multiple searches or cross-source verification. " +
+			"When unsure about scope, run a quick search first — if results are dense or span many sources, prefer delegation. " +
+			"For a single lookup, do it directly. " +
+			"Read-only.",
+		SystemPrompt: `You are a research sub-agent. Your job is to gather information from the web, cross-verify across sources, and synthesize a grounded summary — never to modify files.
+
+What to do:
+- Identify the key questions, search for relevant sources, and extract content from them.
+- Gap-check: identify what's still unanswered and refine your searches.
+- Synthesize findings into a coherent answer with citations.
+- Every factual claim cites a source. Mark confidence per claim when sources disagree or evidence is thin.
+- If you cannot find enough, say so — report what you searched and what's missing.
+
+Shell discipline (read-only intent — there is NO approval gate in sub-agents):
+- Run only commands that read or query — never commands that write, create, delete, install, or download.
+- When unsure whether a command mutates state: assume it does, and do not run it.
+
+Budget:
+- Stop and report "not found" when repeated searches yield nothing relevant.
+- Do not fetch an unbounded number of pages.
+
+Anti-patterns:
+- Do NOT write, edit, or create files.
+- Do NOT dump raw page content — synthesize and quote sparingly.
+- Do NOT fabricate sources.
+- Do NOT take over the reviewer's job (evaluate quality, find problems).`,
+		Tools: []string{
+			"websearch", "webfetch",
+			"browser_navigate", "browser_screenshot", "browser_evaluate",
+			"read", "ls", "grep", "shell",
+			"pptx_read", "excel_read", "word_read",
+		},
+		MaxTurns: 100,
+	}
+}
+
+// reviewerSubAgent is the independent-audit sub-agent. It re-examines the
+// original material within a scope set by the parent (not the gatherers'
+// reports) and reports a structured issue list. It does not produce fixes.
+// Read-only intent.
+func reviewerSubAgent() agent.SubAgent {
+	return agent.SubAgent{
+		Name: "reviewer",
+		Description: "Evaluate content and surface problems — errors, inconsistencies, gaps, " +
+			"quality issues in any artifact. " +
+			"Delegate when the review needs a structured issue list across content that would be costly to examine inline. " +
+			"When unsure about scope, skim the items first — if there's substantial ground to cover, prefer delegation. " +
+			"For a quick single-item check, do it directly. " +
+			"Read-only.",
+		SystemPrompt: `You are an independent-audit sub-agent. Your job is to re-examine the original material within the scope set by the parent and report problems — never to modify anything. You form your own judgment from the source, not from a gatherer's summary.
+
+What to do:
+- Understand the scope and criteria from the task.
+- Examine all relevant items, evaluate against each applicable criterion.
+- Report a structured issue list with locations and suggestions.
+
+Check for:
+- Correctness: factual errors, logic flaws, broken references, missing data.
+- Completeness: gaps, omissions, unanswered questions, missing sections.
+- Consistency: contradictions between items, or between claims and their sources.
+- Quality: unclear expression, redundancy, structural issues.
+
+Shell discipline (read-only intent — there is NO approval gate in sub-agents):
+- Run only commands that read or query — never commands that write, create, delete, install, or download.
+- When unsure whether a command mutates state: assume it does, and do not run it.
+
+Output contract:
+- Each issue: severity (critical/high/medium/low), type, location, description, suggestion.
+- Order: critical first, then high, medium, low.
+- If NO issues are found, state that explicitly — do not pad with nits.
+- Quote the specific problematic portion, not entire items.
+
+Severity:
+- critical: renders the content wrong or unusable.
+- high: significant error or omission.
+- medium: real issue with limited impact.
+- low: minor quality or consistency note.
+
+Budget:
+- Stay scoped to the task — do not review items outside the requested scope.
+
+Anti-patterns:
+- Do NOT write, edit, or create files — you report, the parent fixes.
+- Do NOT speculate about problems without citing specific evidence.
+- Do NOT take over the explorer's job (collect and organize local information).
+- Do NOT take over the researcher's job (gather new external information).
+- Describe fixes in suggestions; do not produce the corrected content.`,
+		Tools:    []string{"read", "ls", "grep", "shell", "webfetch", "pptx_read", "excel_read", "word_read"},
+		MaxTurns: 100,
+	}
 }
 
 // setupTelemetry initializes the OpenTelemetry TracerProvider from config.
@@ -447,14 +683,11 @@ func buildOpts(opts []agent.Option, caps config.Capabilities, model hwcloud.Mode
 // the caller must defer. When cfg.Telemetry.Endpoint is empty, a no-op
 // provider is returned — spans are created but never exported, so the otel
 // hook can be wired unconditionally.
-func setupTelemetry(ctx context.Context, cfg config.Config) (trace.Tracer, func(), error) {
+func setupTelemetry(ctx context.Context, cfg config.Config) (*otelhooks.TracerHolder, *otelhooks.SetupResult, func(), error) {
 	insecure := true
 	if cfg.Telemetry.Insecure != nil {
 		insecure = *cfg.Telemetry.Insecure
 	}
-	// ServiceName defaults to version.Name (the binary identity set via
-	// ldflags in build.sh) so the trace's service.name matches the actual
-	// binary name, not a hardcoded string.
 	serviceName := strings.TrimSpace(cfg.Telemetry.ServiceName)
 	if serviceName == "" {
 		serviceName = version.Name
@@ -466,8 +699,9 @@ func setupTelemetry(ctx context.Context, cfg config.Config) (trace.Tracer, func(
 		Insecure:    insecure,
 	})
 	if err != nil {
-		return nil, func() {}, err
+		return nil, nil, func() {}, err
 	}
+	holder := otelhooks.NewTracerHolder(result.Tracer)
 	shutdown := func() {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -475,10 +709,262 @@ func setupTelemetry(ctx context.Context, cfg config.Config) (trace.Tracer, func(
 			slog.Warn("telemetry shutdown failed", "error", err)
 		}
 	}
-	return result.Tracer, shutdown, nil
+	return holder, result, shutdown, nil
 }
 
-// buildRuntimeDeps returns the always-on runtime dependencies shared by all
+// ── Settings hot-reload ──
+
+// settingsWatcher holds the state needed to hot-reload settings.json at
+// runtime: the previous config (for diffing), the TracerHolder (for
+// telemetry reconfiguration), and the ACP AgentServer (for model registry
+// updates, nil in REST/run mode).
+type settingsWatcher struct {
+	cfgPath    string
+	mu         sync.Mutex
+	prev       *config.Config
+	holder     *otelhooks.TracerHolder
+	prevResult *otelhooks.SetupResult
+	shutdown   func()
+	srv        *acp.AgentServer // nil in REST/run mode
+}
+
+// activeWatcher is the process-wide settings watcher, set when the server
+// starts. The settings tool's `reload` action and the /settings reload
+// slash command use it to apply changes on demand. nil when no server is
+// running (CLI mode).
+//
+// atomic.Pointer provides happens-before synchronization between the writer
+// (server startup) and readers (settings tool reload action in ACP session
+// goroutines) — a plain global var would be a data race.
+var activeWatcher atomic.Pointer[settingsWatcher]
+
+// settingsReloadFn is the single reload entry point shared by the settings
+// tool's reload action and the /settings reload slash command. Set at
+// server startup (ACP and REST). atomic.Pointer for thread safety —
+// written once at startup, read from session goroutines.
+var settingsReloadFn atomic.Pointer[func(ctx context.Context) acp.ReloadResult]
+
+// loadSettingsReloadFn returns the current reload function or nil.
+func loadSettingsReloadFn() func(ctx context.Context) acp.ReloadResult {
+	fn := settingsReloadFn.Load()
+	if fn == nil {
+		return nil
+	}
+	return *fn
+}
+
+// reload reads the new settings.json, parses it, diffs against the previous
+// config, and applies changes to telemetry/log-level/models. Returns a
+// acp.ReloadResult describing what was applied/skipped. Called by the
+// watcher (auto) and by the settings tool's `reload` action (explicit).
+func (sw *settingsWatcher) reload(ctx context.Context) acp.ReloadResult {
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+
+	var result acp.ReloadResult
+
+	raw, err := os.ReadFile(sw.cfgPath)
+	if err != nil {
+		result.ParseError = fmt.Sprintf("cannot read file: %v", err)
+		slog.Warn("settings reload: cannot read file", "error", err)
+		return result
+	}
+	// ── Env hot-reload ──
+	// The env map (settings.json "env" field) is applied via os.Setenv
+	// BEFORE the final ExpandBytes so ${VAR} references resolve against
+	// the updated environment in the same reload pass.
+	//
+	// To extract the env map we NormalizeRawRefs (wraps raw-mode ${VAR}
+	// in sentinel-quoted strings so the JSON is valid) then unmarshal
+	// into a partial struct. This avoids a chicken-and-egg deadlock:
+	// raw-mode ${PORT} (e.g. {"port": ${PORT}}) with PORT defined only in
+	// the env map would fail JSON parse on the raw bytes → env reload
+	// never runs → PORT never gets Setenv → final expand also fails.
+	// NormalizeRawRefs makes the JSON parseable without expanding ${VAR},
+	// so the env map is extracted before Setenv runs.
+	diskRaw := raw
+	var envProbe struct {
+		Env map[string]string `json:"env,omitempty"`
+	}
+	json.Unmarshal(config.NormalizeRawRefs(diskRaw), &envProbe)
+	envChanged := false
+	for k, v := range envProbe.Env {
+		if old, ok := sw.prev.Env[k]; !ok || old != v {
+			os.Setenv(k, v)
+			envChanged = true
+		}
+	}
+	if envChanged {
+		result.Applied = append(result.Applied, "env vars updated")
+		slog.Info("settings reloaded: env vars updated")
+	}
+
+	// Final expansion: expand the ORIGINAL disk bytes with the updated
+	// environment. Warnings from this pass are the real ones — a var
+	// referenced without a default that is still unset after env reload
+	// is a genuine misconfiguration.
+	raw, reloadWarns := config.ExpandBytes(diskRaw)
+	for _, w := range reloadWarns {
+		slog.Warn("settings reload: env var referenced but not set", "var", w)
+	}
+	var newCfg config.Config
+	if err := json.Unmarshal(raw, &newCfg); err != nil {
+		result.ParseError = fmt.Sprintf("parse failed: %v", err)
+		slog.Warn("settings reload: parse failed, keeping previous config", "error", err)
+		return result
+	}
+
+	config.ApplyDefaults(&newCfg, sw.cfgPath)
+
+	// Validate-gated reload: if the new config introduces NEW enum violations
+	// (violations not present in the previously-accepted config), skip the
+	// reload and keep the previous config. The running server stays on the
+	// last-known-good config rather than silently degrading.
+	//
+	// Only NEW violations block the reload: if the server started with an
+	// existing violation (startup warns but does not fatal), a subsequent
+	// reload that changes an unrelated field (e.g. telemetry) should NOT be
+	// blocked by the pre-existing violation — the operator's edit is
+	// orthogonal. Differencing against sw.prev avoids this trap. Pre-existing
+	// violations are re-logged (info) so they stay visible.
+	newViolations := config.CheckEnums(&newCfg)
+	prevViolations := config.CheckEnums(sw.prev)
+	prevSet := make(map[string]struct{}, len(prevViolations))
+	for _, pv := range prevViolations {
+		prevSet[pv] = struct{}{}
+	}
+	var fresh []string
+	for _, v := range newViolations {
+		if _, ok := prevSet[v]; !ok {
+			fresh = append(fresh, v)
+		}
+	}
+	if len(fresh) > 0 {
+		result.Violations = fresh
+		for _, v := range fresh {
+			slog.Warn("settings reload: new validation violation, keeping previous config", "violation", v)
+		}
+		return result
+	}
+	// No new violations. Re-log any pre-existing ones so the operator is
+	// reminded they're still present (the server is running with them).
+	for _, v := range newViolations {
+		slog.Warn("settings reload: pre-existing violation still present (not blocking)", "violation", v)
+	}
+
+	// Telemetry.
+	if !reflect.DeepEqual(sw.prev.Telemetry, newCfg.Telemetry) {
+		sw.reconfigureTelemetry(ctx, newCfg)
+		result.Applied = append(result.Applied, "telemetry reconfigured")
+	}
+
+	// Log level.
+	if sw.prev.Log.Level != newCfg.Log.Level {
+		reconfigureLogLevel(newCfg.Log.Level)
+		result.Applied = append(result.Applied, fmt.Sprintf("log level: %s→%s", sw.prev.Log.Level, newCfg.Log.Level))
+		slog.Info("settings reloaded: log level", "level", newCfg.Log.Level)
+	}
+
+	// Providers/models (ACP only — REST/run have no AgentServer).
+	if sw.srv != nil && !reflect.DeepEqual(sw.prev.Provider, newCfg.Provider) {
+		sw.reconfigureModels(newCfg)
+		result.Applied = append(result.Applied, fmt.Sprintf("providers (disk): %d→%d — note: model registry is additive-only (deleted providers stay in memory until restart; new sessions can still use them)", len(sw.prev.Provider), len(newCfg.Provider)))
+	}
+
+	// MCP servers (ACP only). Settings servers are merged with client-
+	// advertised ones at session connect; hot-swapping affects new sessions
+	// only (existing sessions keep their connected tools).
+	if sw.srv != nil && !reflect.DeepEqual(sw.prev.McpServers, newCfg.McpServers) {
+		sw.srv.SetSettingsMcpServers(convertMcpServers(newCfg.McpServers))
+		result.Applied = append(result.Applied, fmt.Sprintf("mcp servers: %d→%d (new sessions)", len(sw.prev.McpServers), len(newCfg.McpServers)))
+		slog.Info("settings reloaded: mcp servers", "count", len(newCfg.McpServers))
+	}
+
+	sw.prev = &newCfg
+	if len(result.Applied) == 0 {
+		result.Applied = append(result.Applied, "no hot-reloadable changes (restart may be required for non-reloadable fields)")
+	}
+	slog.Info("settings reloaded")
+	return result
+}
+
+// reconfigureTelemetry shuts down the old TracerProvider and creates a new
+// one with the updated endpoint/protocol. The TracerHolder is updated so
+// all hooks and observers pick up the new tracer.
+func (sw *settingsWatcher) reconfigureTelemetry(ctx context.Context, cfg config.Config) {
+	// Shutdown old tracer with a timeout so a stuck exporter doesn't block.
+	if sw.prevResult != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := sw.prevResult.Shutdown(shutdownCtx); err != nil {
+			slog.Warn("settings reload: old telemetry shutdown failed", "error", err)
+		}
+		cancel()
+	}
+
+	insecure := true
+	if cfg.Telemetry.Insecure != nil {
+		insecure = *cfg.Telemetry.Insecure
+	}
+	serviceName := strings.TrimSpace(cfg.Telemetry.ServiceName)
+	if serviceName == "" {
+		serviceName = version.Name
+	}
+	result, err := otelhooks.SetupTracer(ctx, otelhooks.Config{
+		Endpoint:    cfg.Telemetry.Endpoint,
+		Protocol:    cfg.Telemetry.Protocol,
+		ServiceName: serviceName,
+		Insecure:    insecure,
+	})
+	if err != nil {
+		slog.Warn("settings reload: telemetry setup failed", "error", err)
+		return
+	}
+	sw.prevResult = result
+	sw.shutdown = func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := result.Shutdown(shutdownCtx); err != nil {
+			slog.Warn("telemetry shutdown failed", "error", err)
+		}
+	}
+	// Swap the tracer in the holder — all hooks/observers pick it up.
+	if sw.holder != nil {
+		sw.holder.Set(result.Tracer)
+	}
+	slog.Info("settings reloaded: telemetry", "endpoint", cfg.Telemetry.Endpoint, "protocol", cfg.Telemetry.Protocol)
+}
+
+// reconfigureModels applies provider/model additions and updates to the ACP
+// model registry. New providers/models are inserted via SetModel; changed
+// providers (edited API key/baseURL/context window) are replaced in place.
+//
+// Providers no longer in settings are NOT removed. Two reasons:
+//  1. Plugin-injected providers (from cli:settings plugins) are absent from
+//     the file-only config that reload parses, so a delete-on-missing loop
+//     would scrub them on every reload. SetModel is replace-or-insert, so
+//     add/update still works; the missing-from-file case is simply left
+//     untouched.
+//  2. Existing sessions may still reference a model the user just removed
+//     from settings.json; deletion would break them. Removal happens on
+//     restart.
+//
+// This matches the original design intent this function's comment stated
+// ("removed ones are logged but not deleted") before the delete loop was
+// added in contradiction to it.
+func (sw *settingsWatcher) reconfigureModels(cfg config.Config) {
+	_, newInfos := buildModels(cfg.Provider)
+	for _, mi := range newInfos {
+		sw.srv.SetModel(mi.Provider, mi.ID, mi.APIKey, mi.BaseURL,
+			mi.MaxInputTokens, mi.MaxOutputTokens)
+	}
+	// The extractor uses a dynamic model lookup (SetModelFn at startup),
+	// so it automatically picks up the new model instances — no manual
+	// update needed here.
+	// Notify all active sessions so the frontend model dropdown refreshes.
+	sw.srv.BroadcastConfigOptions()
+	slog.Info("settings reloaded: models", "providers", len(cfg.Provider), "models", len(newInfos))
+}
+
 // modes: the RunHooks pipeline and the stage observer. Mode-specific
 // capabilities (Tools, Memory, Approver) are added by the caller.
 //
@@ -488,14 +974,19 @@ func setupTelemetry(ctx context.Context, cfg config.Config) (trace.Tracer, func(
 // spans. Hook order is redact → otel → slog: redact first (secrets masked
 // before any other hook sees the data), otel before slog (spans carry the
 // redacted args).
-func buildRuntimeDeps(caps config.Capabilities, sensitive config.SensitiveConfig, tracer trace.Tracer) kernel.Deps {
+func buildRuntimeDeps(caps config.Capabilities, sensitive config.SensitiveConfig, holder *otelhooks.TracerHolder) kernel.Deps {
 	hooks := []hwcloud.RunHooks{
 		redacthook.NewHook(sensitive.Env),
 	}
 	observers := []hwcloud.RunObserver{buildSlogObserver()}
-	if tracer != nil {
-		hooks = append(hooks, otelhooks.New(tracer))
-		observers = append(observers, otelhooks.NewObserver(tracer))
+	// Always mount OTel hooks/observer (even when tracer is nil at startup)
+	// so runtime telemetry activation via settings hot-reload works without
+	// rebuilding kernel.Deps. When tracer is nil, Start() returns a no-op
+	// span — zero overhead. When holder.Set(newTracer) is called later by
+	// the settings watcher, spans start being created and exported.
+	if holder != nil {
+		hooks = append(hooks, otelhooks.NewWithHolder(holder))
+		observers = append(observers, otelhooks.NewObserverWithHolder(holder))
 	}
 	hooks = append(hooks, buildSlogHooks())
 	return kernel.Deps{

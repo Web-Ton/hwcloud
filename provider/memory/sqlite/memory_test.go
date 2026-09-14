@@ -15,8 +15,8 @@ import (
 // turn_id, parent_run_id) on events emitted by the sqlite Memory's leaf
 // functions (indexEmbedding + knowledgeRecall).
 type captureDec struct {
-	mu      sync.Mutex
-	events  []hwcloud.DecisionEvent
+	mu     sync.Mutex
+	events []hwcloud.DecisionEvent
 }
 
 func (c *captureDec) ObserveDecision(_ context.Context, e hwcloud.DecisionEvent) {

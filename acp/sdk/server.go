@@ -31,6 +31,8 @@ type AgentHandler interface {
 	OnCloseSession(ctx context.Context, req CloseSessionRequest) (*CloseSessionResponse, error)
 	OnDeleteSession(ctx context.Context, req DeleteSessionRequest) (*DeleteSessionResponse, error)
 	OnListSessions(ctx context.Context, req ListSessionsRequest) (*ListSessionsResponse, error)
+	OnListMessages(ctx context.Context, req ListMessagesRequest) (*ListMessagesResponse, error)
+	OnListConfigOptions(ctx context.Context, req ListConfigOptionsRequest) (*ListConfigOptionsResponse, error)
 	OnSetSessionMode(ctx context.Context, req SetSessionModeRequest) (*SetSessionModeResponse, error)
 	OnSetSessionConfigOption(ctx context.Context, req SetSessionConfigOptionRequest) (*SetSessionConfigOptionResponse, error)
 	OnPrompt(ctx context.Context, req PromptRequest, sender SessionEventSender) (*PromptResponse, error)
@@ -47,6 +49,7 @@ type SessionEventSender interface {
 	SendToolCall(update ToolCallUpdate) error
 	SendPlanUpdate(entries []PlanEntry) error
 	SendAvailableCommands(cmds []AvailableCommand) error
+	SendAvailableSkills(skills []AvailableSkill) error
 	SendModeUpdate(modeID SessionModeId) error
 	SendConfigOptionUpdate(opts []SessionConfigOption) error
 	SendUsageUpdate(used, total int, cost *Cost) error
@@ -109,6 +112,9 @@ func (s *Server) RunTransport(ctx context.Context, w io.Writer, r io.Reader) err
 	}
 	if u, ok := s.handler.(ClientRPCUser); ok {
 		u.SetClientRequester(mux)
+	}
+	if u, ok := s.handler.(TurnTriggerUser); ok {
+		u.SetTurnTrigger(mux.triggerTurn)
 	}
 	go mux.writerLoop()
 	return mux.serve(ctx, r)
@@ -411,6 +417,18 @@ func (m *mux) route(msg jsonrpcMessage) {
 				return m.handler.OnListSessions(ctx, req)
 			})
 		}
+	case "session/list_messages":
+		if isReq {
+			dispatch(m, msg, func(ctx context.Context, req ListMessagesRequest) (*ListMessagesResponse, error) {
+				return m.handler.OnListMessages(ctx, req)
+			})
+		}
+	case "session/list_config_options":
+		if isReq {
+			dispatch(m, msg, func(ctx context.Context, req ListConfigOptionsRequest) (*ListConfigOptionsResponse, error) {
+				return m.handler.OnListConfigOptions(ctx, req)
+			})
+		}
 	case "session/prompt":
 		if isReq {
 			// Run in a goroutine so the serve loop continues
@@ -526,6 +544,55 @@ func (m *mux) handlePrompt(msg jsonrpcMessage) {
 		return
 	}
 	m.writeResult(msg.ID, resp)
+}
+
+// triggerTurn starts a turn on a session without a client prompt — used by
+// the handler to process async completions (e.g. sub-agent results) while
+// the user is idle. It acquires the same per-session lock as handlePrompt,
+// so the triggered turn is fully serialized with user turns: no two turns
+// ever run concurrently on the same session. The sender is the same
+// promptSender type, so all session/update notifications reach the client.
+// Unlike handlePrompt there is no JSON-RPC response — the turn's output
+// reaches the client via the sender's notifications (agent_message_chunk,
+// tool_call_update, etc.).
+func (m *mux) triggerTurn(sid SessionId, text string) {
+	muI, _ := m.sessionLocks.LoadOrStore(sid, &sync.Mutex{})
+	mu := muI.(*sync.Mutex)
+	mu.Lock()
+	defer mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	req := PromptRequest{
+		SessionID: sid,
+		Prompt:    []ContentBlock{{Type: "text", Text: text}},
+	}
+	sender := &promptSender{m: m, sid: sid}
+	resp, err := m.handler.OnPrompt(ctx, req, sender)
+	if err != nil {
+		slog.Warn("idle turn failed", "session", sid, "error", err)
+	}
+
+	// Idle turns (system-reminders, sub-agent completions) have no client
+	// request, so handlePrompt's writeResult (JSON-RPC response with
+	// stopReason) never fires. The frontend only recognizes end-turn via
+	// that response, so without a signal it stays stuck in "running".
+	//
+	// Send an "idle_turn_end" session/update with the stopReason. This is
+	// a custom session/update subtype (same pattern as context_compacting,
+	// available_skills_update, etc.) — the frontend handles it to
+	// re-enable user input. Unrecognized subtypes are silently ignored per
+	// ACP spec, so older clients that don't handle it are unaffected (they
+	// just don't get the end-turn signal for idle turns — same as today).
+	stopReason := StopReasonEndTurn
+	if resp != nil && resp.StopReason != "" {
+		stopReason = resp.StopReason
+	}
+	sender.send(SessionUpdate{
+		SessionUpdate: "idle_turn_end",
+		Meta:          map[string]any{"stopReason": stopReason},
+	})
 }
 
 func (m *mux) handleCancel(msg jsonrpcMessage) {
@@ -874,6 +941,11 @@ func (s *promptSender) SendPlanUpdate(entries []PlanEntry) error {
 
 func (s *promptSender) SendAvailableCommands(cmds []AvailableCommand) error {
 	s.send(SessionUpdate{SessionUpdate: "available_commands_update", AvailableCommands: cmds, Meta: nowMeta()})
+	return nil
+}
+
+func (s *promptSender) SendAvailableSkills(skills []AvailableSkill) error {
+	s.send(SessionUpdate{SessionUpdate: "available_skills_update", AvailableSkills: skills, Meta: nowMeta()})
 	return nil
 }
 

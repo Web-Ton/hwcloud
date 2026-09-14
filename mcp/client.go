@@ -13,8 +13,8 @@ import (
 	"sync"
 	"sync/atomic"
 
-	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 	hwcloud "github.com/Cloud-Developer-Department/hwcloud"
+	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // Client connects to an external MCP server and imports its tools.

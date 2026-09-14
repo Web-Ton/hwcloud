@@ -10,6 +10,7 @@ import (
 	"github.com/Cloud-Developer-Department/hwcloud/agent"
 	"github.com/Cloud-Developer-Department/hwcloud/cmd/cli/config"
 	ctxpkg "github.com/Cloud-Developer-Department/hwcloud/context"
+	"github.com/Cloud-Developer-Department/hwcloud/guard/llm"
 	"github.com/Cloud-Developer-Department/hwcloud/kernel"
 	"github.com/Cloud-Developer-Department/hwcloud/sandbox/native"
 	"github.com/Cloud-Developer-Department/hwcloud/summarizer"
@@ -22,9 +23,10 @@ import (
 // extracted after the run and recalled across runs (user-level scope), so
 // "run" participates in the knowledge closed loop.
 func RunCLI(ctx context.Context, cfg *config.Config, message string) error {
-	// 1. Build model from config (unexported: buildModels, firstModel)
-	models, _ := buildModels(cfg.Provider)
-	m := firstModel(models)
+	// 1. Build model from config (unexported: buildModels, resolveModel).
+	// settings "model" wins, else the first configured model.
+	_, modelInfos := buildModels(cfg.Provider)
+	m := resolveModel(cfg.Model, modelInfos)
 	if m == nil {
 		return fmt.Errorf("no models configured. Please add a provider in %s", config.Path())
 	}
@@ -46,7 +48,7 @@ func RunCLI(ctx context.Context, cfg *config.Config, message string) error {
 	workDir, _ := os.Getwd()
 	policy := sandboxPolicy(cfg.Sandbox)
 	sb, err := native.NewWithPolicy(workDir, policy)
-	runToolList := []string{"shell", "read", "write", "ls", "grep", "websearch", "webfetch"}
+	runToolList := []string{"shell", "read", "write", "ls", "grep", "websearch", "webfetch", "settings"}
 	if caps.OnBrowser() {
 		runToolList = append(runToolList, "browser")
 	}
@@ -64,18 +66,25 @@ func RunCLI(ctx context.Context, cfg *config.Config, message string) error {
 	opts := []agent.Option{
 		agent.WithModel(m),
 		agent.WithSystemPrompts(prompts...),
-		agent.WithMaxTurns(50),
+		agent.WithMaxTurns(500),
 	}
-	opts, skillProvider := buildOpts(opts, caps, m)
+	// CLI is single-process with no model hot-reload, so a static guard
+	// is correct — no dynamic lookup needed.
+	if caps.OnGuard() && m != nil {
+		g := llm.New(m)
+		opts = append(opts, agent.WithInputGuard(g))
+		opts = append(opts, agent.WithOutputGuard(g.Output()))
+	}
+	opts, skillProvider := buildOpts(opts, caps)
 	agentCfg := agent.New(version.Name, opts...)
 
-	tracer, telemetryShutdown, err := setupTelemetry(ctx, *cfg)
+	holder, _, telemetryShutdown, err := setupTelemetry(ctx, *cfg)
 	if err != nil {
 		return fmt.Errorf("telemetry init: %w", err)
 	}
 	defer telemetryShutdown()
 
-	deps := buildRuntimeDeps(caps, cfg.Sensitive, tracer)
+	deps := buildRuntimeDeps(caps, cfg.Sensitive, holder)
 	deps.Tools = tools
 	deps.SkillProvider = skillProvider
 	if caps.OnMemory() {
@@ -85,10 +94,14 @@ func RunCLI(ctx context.Context, cfg *config.Config, message string) error {
 		// One shared background extractor: knowledge from this run is
 		// stored and recalled by later runs (and by the servers sharing
 		// this db).
-		deps.Extractor = ctxpkg.NewAsyncExtractor(ctxpkg.NewLLMExtractor(m, knowledge))
+		deps.Extractor = ctxpkg.NewAsyncExtractor(ctxpkg.NewLLMExtractor(func() hwcloud.Model { return m }, knowledge))
 	}
 	if caps.OnMemory() && caps.OnSummarizer() && m != nil {
-		ms.WithSummarizer(summarizer.New(m).WithMaxTokens(agentCfg.MaxCompressedTokens))
+		sumz := summarizer.New(m).WithMaxTokens(agentCfg.MaxCompressedTokens)
+		ms.WithSummarizer(sumz)
+		// Share the summarizer with sub-agent children so their in-memory
+		// stores get compaction parity with the parent.
+		deps.Summarizer = sumz
 	}
 
 	// 6. Fresh session per run (no cross-run conversation history, but

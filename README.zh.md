@@ -1,60 +1,35 @@
-# hwcloud
+<div align="center">
+  <img src="docs/logo.svg" alt="hwcloud" width="320">
 
-> [English](README.md) | [Architecture](DESIGN.md) | [架构 (中文)](DESIGN.zh.md)
+  Go 语言实现的 AI Agent 运行时内核 — 可插拔、沙箱隔离、原生 ACP 协议。
 
-一个完全可插拔的多智能体 AI Agent 框架，Go 语言实现。
+  [![CI](https://github.com/Cloud-Developer-Department/hwcloud/actions/workflows/ci.yml/badge.svg)](https://github.com/Cloud-Developer-Department/hwcloud/actions/workflows/ci.yml)
+  [![Go Reference](https://pkg.go.dev/badge/github.com/Cloud-Developer-Department/hwcloud.svg)](https://pkg.go.dev/github.com/Cloud-Developer-Department/hwcloud)
+  [![Go Report Card](https://goreportcard.com/badge/github.com/Cloud-Developer-Department/hwcloud)](https://goreportcard.com/report/github.com/Cloud-Developer-Department/hwcloud)
+  [![GitHub Stars](https://img.shields.io/github/stars/Cloud-Developer-Department/hwcloud?style=social)](https://github.com/Cloud-Developer-Department/hwcloud/stargazers)
+  [![GitHub Discussions](https://img.shields.io/github/discussions/Cloud-Developer-Department/hwcloud)](https://github.com/Cloud-Developer-Department/hwcloud/discussions)
+  [![GitHub PRs](https://img.shields.io/github/issues-pr/Cloud-Developer-Department/hwcloud)](https://github.com/Cloud-Developer-Department/hwcloud/pulls)
+  [![License](https://img.shields.io/github/license/Cloud-Developer-Department/hwcloud)](LICENSE)
 
-## 特性
+  [English](README.md) · [Architecture](DESIGN.md) · [架构 (中文)](DESIGN.zh.md)
 
-- **全插件架构** — 每个组件都是接口：Model、Memory、Tools、Guards、Approver、Hooks、Observer
-- **ACP v1 协议** — 完整的 Agent Client Protocol 实现，基于 stdio（JSON-RPC 2.0）。可用任何 ACP 客户端（VSCode 插件、Zed 等）
-- **Plan 模式** — `plan_create`/`plan_update` 工具让 agent 将复杂任务分解为结构化步骤，实时追踪进度
-- **多智能体团队** — agent 之间通过 `transfer_to_*` 工具交接任务；每个 agent 有独立的记忆、工具和守卫
-- **多智能体编排** — LLM 驱动的 DAG 分解、并行执行和自动重规划（`orchestrate/`）
-- **SSE 流式输出** — 实时逐 token 渲染，支持 reasoning 展示、工具调用卡片
-- **结构化工具结果** — `ToolResult` 携带内容/JSON/错误/截断状态；超长输出自动落盘（按行包装、read/grep 可读），不淹没模型上下文
-- **审批策略引擎** — 分层策略链（规则 → 安全 → 审批记忆 → 人工），支持参数编辑和跨重启的 "始终允许" 决策
-- **自我进化** — LLM 提取器将完成的对话转化为持久知识，在后续会话中召回
-- **三层记忆系统** — Working（token 驱动）、Compressed（LLM 增量摘要，`summarizer/`）、Archive（向量/关键词检索，永不删除）；三层均可插拔 Provider，含远程 OpenViking 上下文数据库
-- **沙箱环境** — 原生 OS 级别隔离（Linux bwrap、macOS Seatbelt），安全执行 shell、文件、网络操作
-- **WASM 插件** — Agent 级：`agent:tools` 和 `agent:observers` 接入工具/观测器管线。CLI 级：`cli:settings`、`cli:commands`、`cli:observers`、`cli:http`，用于设置注入、命令扩展、生命周期监控和自定义 HTTP 路由。任意插件均可声明 cron 定时任务。
-- **静态上下文配置** — `AGENTS.md`（工作规则）和 `SOUL.md`（性格与底线），支持用户级和项目级覆盖
-- **Slash 命令** — 内置 `/help`、`/mode`、`/model`、`/compact`、`/context`、`/cwd`、`/clear`、`/rename`、`/sessions`，通过 `slash/` 注册表扩展
-- **完整 CLI** — `hwcloud`，cobra 命令、配置驱动模型、keyring 密钥管理、WASM 插件运行时
-- **IM 频道** — 飞书/Lark（WebSocket，卡片式流式输出：Markdown 渲染、工具调用卡片，一键扫码创建应用，内嵌审批按钮、/clear 和 /mode 命令）、个人微信（腾讯 ilinkai 官方通道，扫码登录 + 配对码，/clear 命令）、企业微信（官方长连接，原生流式回复，扫码自动创建机器人，/clear 命令）
-- **RunHooks 状态传递** — Start/End 回调共享不透明状态，OTEL 正确嵌套 span，slog 精确计时
-- **动态上下文** — 会话级 plan 状态和 mode 指令每轮自动注入 prompt
+  如果 hwcloud 对你有帮助，请在 GitHub 上点个 ⭐！
+</div>
 
 ## 快速开始
 
+**前置条件：** Go 1.26.4+ 和一个 OpenAI 兼容的 API key。
+
 ```bash
-# 编译 CLI
-go build -o hwcloud ./cmd/cli/
+# 编译（设置 HWCLOUD_BINARY_NAME 可自定义二进制标识）
+./build.sh
+# 或: HWCLOUD_BINARY_NAME=myagent ./build.sh
 
-# 查看版本号
-./hwcloud -v
-
-# ACP 模式（stdio — 配合 VSCode/Zed ACP 插件使用）
+# ACP 模式 — 配合 VSCode/Zed ACP 插件使用
 ./hwcloud serve --acp
 
-# REST 模式（HTTP + SSE）
-./hwcloud serve --port 8080
-
-# 一次性流式对话
-./hwcloud run "你好，请介绍一下你自己"
-
-# 启用 OS 原生沙箱执行 shell 命令
-./hwcloud serve --sandbox --port 8080
-
-# 按需开关能力（默认：memory/summarizer/skills/mcp/embedder 开，guard/approver 关）
-./hwcloud serve --guard on --approver on
-
-# 静默所有日志输出
-./hwcloud serve -q --port 8080
-
-# 管理系统密钥环里
-./hwcloud keyring set mykey keyvalue
-./hwcloud keyring get mykey
+# TUI 模式 — 终端交互式聊天
+./hwcloud tui
 ```
 
 ### 配置
@@ -69,7 +44,7 @@ go build -o hwcloud ./cmd/cli/
       "api_key": "sk-...",
       "models": ["gpt-4o"]
     }
-  },
+  }
 }
 ```
 
@@ -97,8 +72,6 @@ export BOCHA_API_KEY=<你的-key>   # 在 https://open.bochaai.com 获取
 
 将 agent 接入飞书（Lark），支持群聊、私聊、Markdown 卡片渲染、流式输出。
 
-<img src=".github/images/feishu-bot-effect.jpg" alt="飞书机器人对话效果" width="750" />
-
 **首次使用（无需凭据）：**
 
 ```bash
@@ -106,8 +79,6 @@ export BOCHA_API_KEY=<你的-key>   # 在 https://open.bochaai.com 获取
 ```
 
 终端会出现二维码。打开飞书 App 扫码，确认创建应用即可。SDK 会自动创建机器人应用并配置好权限（`im:message`、`im:message:send_as_bot`、`im.message.receive_v1` 事件、`card.action.trigger` 审批/模式按钮回调），凭据保存在本地。
-
-![首次使用 - 扫码创建应用](.github/images/feishu-first-login.jpg)
 
 **如果已有应用，在 `settings.json` 中配置：**
 
@@ -133,15 +104,12 @@ export BOCHA_API_KEY=<你的-key>   # 在 https://open.bochaai.com 获取
 
 `--channel` flag 是必须的 — 仅配置 settings.json 不会自动启动 bot。如果凭据已在 settings.json 中，启动时会跳过扫码步骤。
 
-![已有应用 - 带凭据启动](.github/images/feishu-subsequent-login.jpg)
-
 **凭据解析优先级：**
 
-| 优先级 | 来源 | 场景 |
-|--------|------|------|
-| 1 | `settings.json` → `channels.feishu` | 已有应用凭据 |
-| 2 | settings.json `channels.feishu` | 上次扫码自动保存（settings 是唯一凭据源） |
-| 3 | 扫码注册 | 首次使用，无任何凭据 |
+| 状态 | 来源 | 场景 |
+|------|------|------|
+| 有凭据 | `settings.json` → `channels.feishu` | 已有应用凭据（手写配置或上次扫码自动保存） |
+| 无凭据 | 扫码注册 | 首次使用，无任何凭据 |
 
 **组合其他模式：**
 
@@ -155,7 +123,7 @@ export BOCHA_API_KEY=<你的-key>   # 在 https://open.bochaai.com 获取
 
 **前端控制面板：**
 
-飞书连接是**进程级守护任务** —— 前端只负责触发和展示，关闭/刷新页面不影响连接。服务暴露两个接口：
+飞书连接是**进程级守护任务** —— 前端只负责触发和展示，关闭/刷新页面不影响连接。服务暴露两组接口（频道控制 + 设置管理）：
 
 | 接口 | 用途 |
 |------|------|
@@ -171,7 +139,7 @@ export BOCHA_API_KEY=<你的-key>   # 在 https://open.bochaai.com 获取
 
 **每个配置目录单实例：** 一个飞书 app = 一个活跃 WebSocket。服务在连接期间持有机器级锁（`<config-dir>/channel/feishu/feishu.lock`）——第二个 `--channel feishu` 实例会快速失败报错，而不是静默抢走事件。进程死亡时锁由内核自动释放。生产部署建议用 systemd/Docker 托管进程（及其连接）。
 
-**配置 MCP 工具（可选）：**
+**配置 MCP 工具（可选，适用于所有模式）：**
 
 ```json
 {
@@ -307,6 +275,27 @@ OpenViking 是一个上下文数据库，提供服务端记忆、技能和资源
 
 `context_providers` 对 `memory`、`skill`、`resource` 各域可设为 `"builtin"` 或 `"openviking"`。留空 = 跟随 endpoint 默认值。
 
+## 特性
+
+- **全插件架构** — 每个组件都是接口：Model、Memory、Tools、Guards、Approver、Hooks、Observer
+- **ACP v1 协议** — 完整的 Agent Client Protocol 实现，基于 stdio（JSON-RPC 2.0）。可用任何 ACP 客户端（VSCode 插件、Zed 等）
+- **Plan 模式** — `plan_create`/`plan_update` 工具让 agent 将复杂任务分解为结构化步骤，实时追踪进度
+- **多智能体团队** — agent 之间通过 `transfer_to_*` 工具交接任务；每个 agent 有独立的记忆、工具和守卫
+- **多智能体编排** — LLM 驱动的 DAG 分解、并行执行和自动重规划（`orchestrate/`）
+- **SSE 流式输出** — 实时逐 token 渲染，支持 reasoning 展示、工具调用卡片
+- **结构化工具结果** — `ToolResult` 携带内容/JSON/错误/截断状态；超长输出自动落盘（按行包装、read/grep 可读），不淹没模型上下文
+- **审批策略引擎** — 分层策略链（规则 → 安全 → 审批记忆 → 人工），支持参数编辑和跨重启的 "始终允许" 决策
+- **自我进化** — LLM 提取器将完成的对话转化为持久知识，在后续会话中召回
+- **三层记忆系统** — Working（token 驱动）、Compressed（LLM 增量摘要，`summarizer/`）、Archive（向量/关键词检索，永不删除）；三层均可插拔 Provider，含远程 OpenViking 上下文数据库
+- **沙箱环境** — 原生 OS 级别隔离（Linux bwrap、macOS Seatbelt），安全执行 shell、文件、网络操作
+- **WASM 插件** — Agent 级：`agent:tools` 和 `agent:observers` 接入工具/观测器管线。CLI 级：`cli:settings`、`cli:commands`、`cli:observers`、`cli:http`，用于设置注入、命令扩展、生命周期监控和自定义 HTTP 路由。任意插件均可声明 cron 定时任务。
+- **静态上下文配置** — `AGENTS.md`（工作规则）和 `SOUL.md`（性格与底线），支持用户级和项目级覆盖
+- **Slash 命令** — 内置 `/help`、`/mode`、`/model`、`/compact`、`/cwd`、`/clear`、`/rename`、`/sessions`，通过 `slash/` 注册表扩展
+- **完整 CLI** — `hwcloud`，cobra 命令、配置驱动模型、keyring 密钥管理、WASM 插件运行时
+- **IM 频道** — 飞书/Lark（WebSocket，卡片式流式输出：Markdown 渲染、工具调用卡片，一键扫码创建应用，内嵌审批按钮、/clear 和 /mode 命令）、个人微信（腾讯 ilinkai 官方通道，扫码登录 + 配对码，/clear 命令）、企业微信（官方长连接，原生流式回复，扫码自动创建机器人，/clear 命令）
+- **RunHooks 状态传递** — Start/End 回调共享不透明状态，OTEL 正确嵌套 span，slog 精确计时
+- **动态上下文** — 会话级 plan 状态和 mode 指令每轮自动注入 prompt
+
 ## 架构
 
 ```
@@ -327,6 +316,9 @@ OpenViking 是一个上下文数据库，提供服务端记忆、技能和资源
 │  └─ eventbus    (审计事件)                   │
 └──────────────────────────────────────────────┘
 ```
+
+> **流水线阶段（8 节点）：** 记忆 → 提示词 → 守卫 → 模型 → 守卫 → 策略 → 工具 → 存储。
+> 上方 6 个框是实现这些阶段的内核子组件。
 
 `agent.Agent` 是纯配置（模型、提示词、守卫、子 agent）；所有可执行逻辑都在运行时及其依赖中——工具、存储、策略、hooks、observer 均为组装时注入的接口。
 
@@ -525,15 +517,15 @@ hwcloud_pdk::export!(EnvSyncPlugin);
 | `examples/observer/` | Pipeline 观测器 |
 | `examples/delegate/` | Agent 作为工具委托 |
 | `examples/sandbox/` | 原生沙箱工具 |
-| `examples/plugin/` | WASM 工具、观测器、定时任务插件 |
+| `examples/plugin/` | WASM 工具、观测器、定时任务、模型切换插件 |
 | `examples/skill/` | 按需加载技能 |
 | `examples/acp/` | ACP agent 协议（server + client） |
 | `examples/artifact/` | 结果策略 — 大型工具结果落盘 |
 | `examples/browser-agent/` | 基于 Playwright MCP 的浏览器 agent |
 | `examples/mcp-client/` | MCP 客户端示例（IaC 流水线） |
-| `examples/frontend/` | Vue.js 前端控制面板（频道状态、设置、二维码渲染） |
+| `site/` | Next.js + React 前端控制面板（频道状态、设置、二维码渲染） |
 | `cmd/cli/` | 完整 CLI，含 WASM 插件运行时 |
-| `cmd/tui/` | TUI 聊天客户端（bubbletea v2，流式输出，人工审批） |
+| `cmd/cli/tui/` | TUI 聊天客户端（bubbletea v2，流式输出，人工审批） |
 
 ## 包
 
@@ -575,7 +567,7 @@ hwcloud_pdk::export!(EnvSyncPlugin);
 | `hooks/otel/` | OpenTelemetry 钩子 |
 | `hooks/slog/` | 结构化日志钩子 |
 | `hooks/redact/` | 工具结果中脱敏环境变量值 |
-| `tool/` | 内置工具 (shell, read, write, ls, grep, edit, websearch, webfetch, ACP fs, ACP terminal) |
+| `tool/` | 内置工具 (shell, read, write, edit, ls, grep, websearch, webfetch, browser, office, ACP fs, ACP terminal) |
 | `channel/` | IM 平台适配器 — 飞书（WebSocket、卡片渲染）、个人微信（ilinkai HTTP）、企业微信（长连接流式） |
 | `keyring/` | 系统密钥环封装（Linux Secret Service/kernel keyring、macOS Keychain、Windows Credential Manager） |
 | `process/` | 后台 shell 进程生命周期管理（跟踪、持久化输出、跨轮次终止） |
@@ -584,5 +576,8 @@ hwcloud_pdk::export!(EnvSyncPlugin);
 | `iac/` | Terraform 封装 — 二进制安装/镜像管理、init/plan/apply/destroy |
 | `version/` | 编译时二进制标识（名称 + 版本，经 ldflags 注入） |
 | `cmd/cli/` | CLI 运行时、WASM 宿主、REST/ACP 服务、设置、频道管理 |
-| `cmd/tui/` | TUI 聊天客户端（bubbletea v2） |
+| `cmd/cli/tui/` | TUI 聊天客户端（bubbletea v2） |
 | `cmd/mcp/` | IaC MCP 服务 — 云部署工具（华为云、阿里云），走 MCP stdio |
+| `skills/` | 内置嵌入技能（`powerpoint`、`skill-creator`）+ `embed.go` 用于 go:embed |
+| `third_party/` | 第三方模型资产（未使用 — embedding 已改为纯外部 provider；待清理） |
+| `site/` | Next.js + React 前端控制面板（频道状态、设置、二维码渲染） |

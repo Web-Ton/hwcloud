@@ -34,7 +34,7 @@ func (rt *Runtime) run(ctx context.Context, session hwcloud.Session, prefix []hw
 	cfgModel := rt.cfg.Model
 	rt.mu.RUnlock()
 	if maxTurns <= 0 {
-		maxTurns = 20 // agent.New's default; guard for zero-value configs
+		maxTurns = 500 // matches agent.New's default; guard for zero-value configs
 	}
 
 	// Resolve model for this run (Model() reads it under the same lock).
@@ -185,6 +185,15 @@ func (rt *Runtime) run(ctx context.Context, session hwcloud.Session, prefix []hw
 				workingMessages = ctxpkg.TrimOrphanToolCalls(messages)
 				rt.compressed = ci.compressed
 				rt.emitCompactionResult(ctx, ch, ci, "tool-turn compaction failed")
+				// After compaction + orphan trim the working set can be empty
+				// (the summary absorbed every user message, and the remaining
+				// assistant→tool pairs were orphan-trimmed). A prompt with
+				// only system/assistant messages is rejected by most providers
+				// ("must contain at least one 'user' or 'tool' role"). Inject
+				// a synthetic <system-reminder> user pointing the model at the
+				// summary. Turn 0 is exempt — it appends the live user input
+				// below (L154).
+				workingMessages = ensureValidWorkingSet(workingMessages)
 			}
 		}
 
@@ -381,8 +390,11 @@ func (rt *Runtime) run(ctx context.Context, session hwcloud.Session, prefix []hw
 	rt.state.Turn = result.TurnCount
 	// Self-evolution: store durable knowledge from this finished run.
 	// Knowledge is user-level (cross-session long-term memory) — the
-	// session ID is NOT part of the scope, or every new session would be
-	// filtered away from the knowledge it should recall.
+	// session ID is NOT part of the recall scope, or every new session
+	// would be filtered away from the knowledge it should recall.
+	// However, SessionID IS used by the OpenViking provider's Store
+	// path to route knowledge fragments into per-conversation OV sessions
+	// so VLM extraction sees a coherent conversation context.
 	//
 	// The call is fire-and-forget: AsyncExtractor (the standard wiring)
 	// enqueues and extracts on its background worker, so this never
@@ -390,7 +402,8 @@ func (rt *Runtime) run(ctx context.Context, session hwcloud.Session, prefix []hw
 	// server (never per run).
 	if rt.deps.Extractor != nil && len(workingMessages) > 0 {
 		rt.deps.Extractor.Extract(ctx, ctxpkg.ContextScope{
-			UserID: session.UserID,
+			UserID:    session.UserID,
+			SessionID: session.ID,
 		}, workingMessages)
 	}
 	chSend(ctx, ch, hwcloud.StreamEvent{Type: hwcloud.StreamDone, Result: result})
@@ -447,15 +460,20 @@ func (rt *Runtime) emitCompactionResult(ctx context.Context, ch chan<- hwcloud.S
 	if ci.err != nil {
 		slog.Error(slogMsg, "error", ci.err)
 		chSend(ctx, ch, hwcloud.StreamEvent{
-			Type: hwcloud.StreamThought,
-			Text: fmt.Sprintf("context compaction failed: %v (degraded — older messages dropped from prompt)\n", ci.err),
+			Type: hwcloud.StreamCompacted,
+			Compaction: &hwcloud.CompactionInfo{
+				Error: ci.err.Error(),
+			},
 		})
 		return
 	}
 	if ci.count > 0 {
 		chSend(ctx, ch, hwcloud.StreamEvent{
-			Type: hwcloud.StreamThought,
-			Text: fmt.Sprintf("Compacted %d messages → summary (freed ~%d tokens)\n", ci.count, ci.freedTokens),
+			Type: hwcloud.StreamCompacted,
+			Compaction: &hwcloud.CompactionInfo{
+				CompressedMessages: ci.count,
+				FreedTokens:        ci.freedTokens,
+			},
 		})
 	}
 }
@@ -530,6 +548,36 @@ func (rt *Runtime) observe(ctx context.Context, stage string, phase string, deta
 		TurnID:      ri.TurnID,
 		ParentRunID: ri.ParentRunID,
 	})
+}
+
+// ensureValidWorkingSet injects a <system-reminder> user placeholder when
+// the working set is empty after compaction + TrimOrphanToolCalls.
+//
+// SafeCompressionBoundary guarantees the working set EITHER starts with a
+// user message OR is empty (it pushes overflow past the last message when no
+// user follows). TrimOrphanToolCalls may then delete an all-assistant/tool
+// working set down to empty. An empty working set means the prompt has only
+// system messages (static + dynamic + summary), which providers reject
+// ("must contain at least one 'user' or 'tool' role").
+//
+// The <system-reminder> tag is the project's existing pattern for injected
+// environment events (sub-agent completions use it — subagent_notify.go).
+// The ACP replay path (acp/server.go) skips <system-reminder> messages so
+// they don't render as raw XML on session load. Transient = not persisted
+// (commit skips it); the next turn re-fetches from the store, and the
+// summary carries the real history.
+func ensureValidWorkingSet(msgs []hwcloud.Message) []hwcloud.Message {
+	if len(msgs) > 0 {
+		return msgs
+	}
+	return []hwcloud.Message{{
+		Role: hwcloud.RoleUser,
+		Content: "<system-reminder>\n" +
+			"Earlier conversation history has been compacted into the summary above. " +
+			"Continue the task based on the summary and any remaining working messages.\n" +
+			"</system-reminder>",
+		Transient: true,
+	}}
 }
 
 // commit appends a message to memory (Transient messages and nil memory skip).

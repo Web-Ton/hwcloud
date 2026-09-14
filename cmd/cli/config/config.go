@@ -27,8 +27,13 @@ type Config struct {
 	Capabilities Capabilities               `json:"capabilities,omitempty"`
 	Embedding    EmbeddingConfig            `json:"embedding,omitempty"`
 	// DefaultMode is the session mode new sessions start in ("auto",
-	// "manual", "plan"). Empty = "manual" (approval-based safe default).
-	DefaultMode string `json:"default_mode,omitempty"`
+	// "semi-auto", "manual", "plan"). Empty = "semi-auto" (auto-allow safe
+	// calls, prompt for destructive).
+	//   auto      — fully automatic, no approval prompts (incl. destructive)
+	//   semi-auto — auto-allow safe calls, prompt for risk_note (destructive)
+	//   manual    — prompt for every tool call
+	//   plan      — read-only planning, no execution
+	DefaultMode string `json:"default_mode,omitempty" valid:"enum=auto|semi-auto|manual|plan;case=cs"`
 	// ContextProviders overrides the backend per capability. A non-empty
 	// OpenViking.Endpoint already switches ALL domains to OpenViking (it
 	// is a whole-context service); set a domain to "builtin" here to keep
@@ -42,22 +47,76 @@ type Config struct {
 	// non-empty, agent runs and tool calls are sent as OTel spans to the
 	// OTLP collector (Jaeger, Tempo, Datadog, Langfuse, Phoenix, ...).
 	Telemetry TelemetryConfig `json:"telemetry,omitempty"`
+	// TUI configures the interactive TUI client (hwcloud tui). When
+	// unset, the TUI uses built-in defaults.
+	TUI TUIConfig `json:"tui,omitempty"`
+}
+
+// TUIConfig configures the interactive TUI client. All fields optional;
+// empty fields keep the built-in defaults.
+type TUIConfig struct {
+	// Mode is the initial session mode ("auto"|"semi-auto"|"manual"|"plan").
+	// Empty falls back to DefaultMode, then "semi-auto" (ApplyDefaults resolves).
+	Mode string `json:"mode,omitempty" valid:"enum=auto|semi-auto|manual|plan;case=cs;skipif=default_mode"`
+	// Suggestions overrides the welcome-page placeholder suggestion list.
+	// Empty = built-in defaults.
+	Suggestions []string `json:"suggestions,omitempty"`
+	// Colors overrides the theme palette. Fields left empty keep the
+	// built-in default. Hex strings, e.g. "#0a0a0a".
+	Colors TUIColors `json:"colors,omitempty"`
+	// Logo overrides the welcome-page logo. A multi-line string (newline-
+	// separated); empty = built-in default block-art logo.
+	Logo string `json:"logo,omitempty"`
+	// LogoGradient, when non-empty, renders the logo with a vertical color
+	// gradient (top→bottom) interpolated across the listed hex stops, e.g.
+	// ["#ffffff","#d0d0d0"]. Empty = single LogoColor (or the default white
+	// gradient).
+	LogoGradient []string `json:"logo_gradient,omitempty"`
+}
+
+// TUIColors overrides individual theme palette entries. Every field is
+// optional; an empty string keeps the built-in default for that color.
+type TUIColors struct {
+	BgNormal    string `json:"bg_normal,omitempty"`
+	BgSecondary string `json:"bg_secondary,omitempty"`
+	BgSurface   string `json:"bg_surface,omitempty"`
+	Primary     string `json:"primary,omitempty"` // plan mode badge / 蓝
+	Success     string `json:"success,omitempty"` // manual mode badge / 绿
+	Warning     string `json:"warning,omitempty"` // auto mode badge / 黄
+	Danger      string `json:"danger,omitempty"`
+	TextNormal  string `json:"text_normal,omitempty"`
+	TextAsh     string `json:"text_ash,omitempty"`
+	BorderGray  string `json:"border_gray,omitempty"`
+	LogoColor   string `json:"logo_color,omitempty"`   // welcome-page logo
+	SelectionBg string `json:"selection_bg,omitempty"` // transcript box-selection highlight
 }
 
 // TelemetryConfig configures OpenTelemetry trace export.
 type TelemetryConfig struct {
-	// Endpoint is the OTLP trace endpoint URL. When empty, telemetry is
-	// disabled. Example: "http://localhost:4318" (HTTP) or
-	// "localhost:4317" (gRPC).
+	// Endpoint is the OTLP collector target. Accepts either a bare
+	// "host:port" (recommended, e.g. "localhost:4318" for HTTP,
+	// "localhost:4317" for gRPC — the scheme is derived from Protocol +
+	// Insecure) or a full URL with scheme (e.g.
+	// "http://localhost:4318" or "https://collector.example:4318/otlp").
+	// When empty, telemetry is disabled.
+	//
+	// Do NOT pass a full URL when also setting Protocol/Insecure for a
+	// bare endpoint — pick one form. The two are mutually exclusive in
+	// intent: a bare host:port pairs with Protocol/Insecure; a full URL
+	// carries its own scheme/path/TLS.
 	Endpoint string `json:"endpoint,omitempty"`
 	// Protocol selects the OTLP transport: "http" (default) or "grpc".
-	Protocol string `json:"protocol,omitempty"`
+	// Ignored when Endpoint is a full URL whose scheme implies the
+	// transport (http:// → HTTP, the gRPC exporter still uses host:port
+	// form in practice — prefer bare host:port for gRPC).
+	Protocol string `json:"protocol,omitempty" valid:"enum=http|grpc;case=ci"`
 	// ServiceName is the OTel resource service.name attribute.
 	// Default: "hwcloud".
 	ServiceName string `json:"service_name,omitempty"`
 	// Insecure disables TLS when the endpoint is plain HTTP. Default:
 	// true (most local collectors use plain HTTP). Set false for a
-	// TLS-secured collector.
+	// TLS-secured collector. Has no effect when Endpoint is a full URL
+	// — the URL's own scheme (http:// vs https://) governs TLS.
 	Insecure *bool `json:"insecure,omitempty"`
 }
 
@@ -73,9 +132,10 @@ type ContextProviderConfig struct {
 // OpenVikingConfig connects to an OpenViking server (direct HTTP API —
 // search/remember/read, no SDK).
 type OpenVikingConfig struct {
-	Endpoint string       `json:"endpoint,omitempty"` // e.g. "http://127.0.0.1:1933"
-	APIKey   string       `json:"api_key,omitempty"`  // Bearer token; empty = no auth
-	Recall   RecallConfig `json:"recall,omitempty"`
+	Endpoint string          `json:"endpoint,omitempty"`                 // e.g. "http://127.0.0.1:1933"
+	APIKey   string          `json:"api_key,omitempty" sensitive:"true"` // Bearer token; empty = no auth
+	Recall   RecallConfig    `json:"recall,omitempty"`
+	Session  OVSessionConfig `json:"session,omitempty"`
 }
 
 // RecallConfig controls OpenViking's type-quota memory recall endpoint
@@ -96,6 +156,33 @@ type RecallConfig struct {
 	MinScore float64        `json:"min_score,omitempty"`
 }
 
+// OVSessionConfig controls the OpenViking session reuse and commit
+// threshold policy. When OpenViking.Endpoint is set, session reuse is
+// automatically enabled with the built-in defaults. Override individual
+// fields here to tune the thresholds.
+//
+// This is the config-layer mirror of openviking.SessionConfig (provider
+// layer). The two structs exist on different layers to keep the config
+// package independent of the provider package. shared.go's
+// applyContextProviders maps between them field-by-field. If you add a
+// field here, also add it to openviking.SessionConfig and the mapping.
+//
+// Defaults (applied by the provider when zero):
+//   - CommitTokenThreshold: 6000 (pending tokens)
+//   - CommitMessageThreshold: 50 (messages since last commit)
+//   - MinCommitIntervalSeconds: 300 (5 minutes)
+//   - KeepRecentTurnCount: 3 (WM v2 retention)
+//   - RetainedMessageTokenBudget: 6000
+//   - MinRawTailSteps: 1
+type OVSessionConfig struct {
+	CommitTokenThreshold       int `json:"commit_token_threshold,omitempty"`
+	CommitMessageThreshold     int `json:"commit_message_threshold,omitempty"`
+	MinCommitIntervalSeconds   int `json:"commit_min_interval_seconds,omitempty"`
+	KeepRecentTurnCount        int `json:"keep_recent_turn_count,omitempty"`
+	RetainedMessageTokenBudget int `json:"retained_message_token_budget,omitempty"`
+	MinRawTailSteps            int `json:"min_raw_tail_steps,omitempty"`
+}
+
 // EmbeddingConfig selects the semantic-embedding backend for knowledge
 // recall. When empty (or Provider == ""), NO embedding backend is wired:
 // the knowledge store stays open (memory CRUD + keyword search work) but
@@ -107,7 +194,7 @@ type EmbeddingConfig struct {
 	Provider string `json:"provider,omitempty"` // "openai" (OpenAI-compatible /embeddings)
 	Model    string `json:"model,omitempty"`    // e.g. "text-embedding-3-small"
 	BaseURL  string `json:"base_url,omitempty"` // e.g. "https://api.openai.com/v1"
-	APIKey   string `json:"api_key,omitempty"`
+	APIKey   string `json:"api_key,omitempty" sensitive:"true"`
 }
 
 // SensitiveConfig controls redaction of sensitive values in tool results.
@@ -131,7 +218,7 @@ type SensitiveConfig struct {
 }
 
 type ProviderConfig struct {
-	APIKey  string        `json:"api_key"`
+	APIKey  string        `json:"api_key" sensitive:"true"`
 	BaseURL string        `json:"base_url"`
 	Models  []ModelConfig `json:"models,omitempty"`
 }
@@ -144,9 +231,9 @@ type ProviderConfig struct {
 //	  "id": "qwen-128k",
 //	  "max_input_tokens": 128000,
 //	  "max_output_tokens": 8192,
-//	  "input_cost_per_token": 0.000001,
-//	  "input_cache_cost_per_token": 0.0000001,
-//	  "output_cost_per_token": 0.000002
+//	  "input_cost_per_million": 1,
+//	  "input_cache_cost_per_million": 0.1,
+//	  "output_cost_per_million": 2
 //	}]
 //
 // max_input_tokens overrides the built-in vendor lookup — required for
@@ -155,12 +242,12 @@ type ProviderConfig struct {
 // requests past 128K with no diagnostics). The cost fields feed usage
 // reporting (ACP usage_update cost). 0/absent = built-in lookup / no cost.
 type ModelConfig struct {
-	ID                     string  `json:"id"`
-	MaxInputTokens         int     `json:"max_input_tokens,omitempty"`
-	MaxOutputTokens        int     `json:"max_output_tokens,omitempty"`
-	InputCostPerToken      float64 `json:"input_cost_per_token,omitempty"`
-	InputCacheCostPerToken float64 `json:"input_cache_cost_per_token,omitempty"`
-	OutputCostPerToken     float64 `json:"output_cost_per_token,omitempty"`
+	ID                       string  `json:"id"`
+	MaxInputTokens           int     `json:"max_input_tokens,omitempty"`
+	MaxOutputTokens          int     `json:"max_output_tokens,omitempty"`
+	InputCostPerMillion      float64 `json:"input_cost_per_million,omitempty"`
+	InputCacheCostPerMillion float64 `json:"input_cache_cost_per_million,omitempty"`
+	OutputCostPerMillion     float64 `json:"output_cost_per_million,omitempty"`
 }
 
 // UnmarshalJSON accepts both the legacy string form ("gpt-4o") and the
@@ -179,7 +266,12 @@ func (m *ModelConfig) UnmarshalJSON(b []byte) error {
 }
 
 type ServerConfig struct {
-	Port int `json:"port,omitempty"`
+	// Host is the listen address for the REST server. Default
+	// "127.0.0.1" (loopback only — the server is not reachable from
+	// the network). Set to "0.0.0.0" to listen on all interfaces
+	// (container/remote-access scenarios).
+	Host string `json:"host,omitempty"`
+	Port int    `json:"port,omitempty"`
 }
 
 // McpServerConfig describes an MCP server using the standard MCP config format
@@ -189,8 +281,8 @@ type McpServerConfig struct {
 	Command string            `json:"command,omitempty"`
 	Args    []string          `json:"args,omitempty"`
 	Env     map[string]string `json:"env,omitempty"`
-	URL     string            `json:"url,omitempty"`  // HTTP/SSE endpoint
-	Type    string            `json:"type,omitempty"` // "stdio" (default), "http", "sse"
+	URL     string            `json:"url,omitempty"`                                      // HTTP/SSE endpoint
+	Type    string            `json:"type,omitempty" valid:"enum=stdio|http|sse;case=cs"` // "stdio" (default), "http", "sse"
 }
 
 // ChannelsConfig holds per-platform IM channel configuration.
@@ -206,7 +298,7 @@ type ChannelsConfig struct {
 // created automatically).
 type WecomConfig struct {
 	BotID  string `json:"bot_id"`
-	Secret string `json:"secret"`
+	Secret string `json:"secret" sensitive:"true"`
 
 	// Explicit marks a channel requested via --channel on the command
 	// line (never persisted, never read from settings). Only explicit
@@ -221,7 +313,7 @@ type WecomConfig struct {
 // issued by QR login; base_url may be redirected per-account by the
 // login flow.
 type WechatConfig struct {
-	Token     string `json:"token"`
+	Token     string `json:"token" sensitive:"true"`
 	BaseURL   string `json:"base_url,omitempty"`
 	AccountID string `json:"account_id,omitempty"`
 	UserID    string `json:"user_id,omitempty"`
@@ -238,7 +330,7 @@ type WechatConfig struct {
 // https://open.feishu.cn/document/home/develop-a-bot-in-5-minutes
 type FeishuConfig struct {
 	AppID     string `json:"app_id"`
-	AppSecret string `json:"app_secret"`
+	AppSecret string `json:"app_secret" sensitive:"true"`
 
 	// Explicit marks a channel requested via --channel on the command
 	// line (never persisted, never read from settings). Only explicit
@@ -264,7 +356,7 @@ type FeishuConfig struct {
 // workspace directory and the system paths already mounted.
 type SandboxConfig struct {
 	Enabled       bool     `json:"enabled,omitempty"`
-	Network       string   `json:"network,omitempty"`
+	Network       string   `json:"network,omitempty" valid:"enum=host|isolated;case=cs"`
 	WritablePaths []string `json:"writable_paths,omitempty"`
 	ReadablePaths []string `json:"readable_paths,omitempty"`
 }
@@ -283,7 +375,7 @@ type LogConfig struct {
 	// Valid: "trace", "debug", "info", "warn", "error". "trace" enables
 	// prompt dumps (every message sent to the model — content included,
 	// which may contain user data and secrets).
-	Level string `json:"level,omitempty"`
+	Level string `json:"level,omitempty" valid:"enum=trace|debug|info|warn|warning|error;case=ci"`
 }
 
 // Path returns the config file path. The default config dir is
@@ -339,6 +431,9 @@ func ApplyDefaults(cfg *Config, settingsPath string) {
 	if len(cfg.Plugins) == 0 {
 		cfg.Plugins = []string{DefaultPluginsDir()}
 	}
+	if cfg.Server.Host == "" {
+		cfg.Server.Host = "127.0.0.1"
+	}
 	if cfg.Server.Port == 0 {
 		cfg.Server.Port = 8080
 	}
@@ -357,6 +452,15 @@ func ApplyDefaults(cfg *Config, settingsPath string) {
 	if cfg.Log.Level == "" {
 		cfg.Log.Level = "info"
 	}
+	// TUI mode resolution: tui.mode → default_mode → "semi-auto". Mirrors
+	// acp/server.go defaultMode() so the TUI and server agree on the
+	// default when neither is set.
+	if cfg.TUI.Mode == "" {
+		cfg.TUI.Mode = cfg.DefaultMode
+	}
+	if cfg.TUI.Mode == "" {
+		cfg.TUI.Mode = "semi-auto"
+	}
 }
 
 func Load(path string) (*Config, error) {
@@ -374,8 +478,37 @@ func Load(path string) (*Config, error) {
 		}
 		return nil, fmt.Errorf("read settings: %w", err)
 	}
+	// Resolve environment-variable references (${VAR}, ${VAR:-default},
+	// $VAR) in the raw JSON bytes before unmarshaling. One byte-level pass
+	// covers every string/int/bool field and keeps the on-disk file literal.
+	// Warnings (unset vars referenced without a default) are suppressed here
+	// — Load is a library/test entry point; callers that want to surface them
+	// (startup, reload) call ExpandBytes themselves.
+	data, _ = ExpandBytes(data)
 	if err := json.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("parse settings: %w", err)
 	}
 	return cfg, nil
+}
+
+// WriteConfig writes the config to path as pretty-printed JSON, creating
+// the parent directory if needed. Used on first run to persist a default
+// settings.json so the user has a file to edit and the fsnotify watcher
+// has something to monitor. Atomic (tmp + rename): a crash mid-write
+// must not leave a truncated file.
+func WriteConfig(cfg *Config, path string) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("create config dir: %w", err)
+	}
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal config: %w", err)
+	}
+	data = append(data, '\n')
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		return fmt.Errorf("write config: %w", err)
+	}
+	return os.Rename(tmp, path)
 }

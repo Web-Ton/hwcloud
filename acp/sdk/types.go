@@ -325,6 +325,59 @@ type SessionInfo struct {
 	AdditionalDirectories []string       `json:"additionalDirectories,omitempty"`
 }
 
+// ── ListMessages ──
+
+// ListMessagesRequest requests the most recent messages of a session
+// without loading it. Messages are returned oldest-first (the store order);
+// Before skips the most recent Before messages to page further back, and
+// Limit caps the window (default 50, max 200).
+type ListMessagesRequest struct {
+	Meta      map[string]any `json:"_meta,omitempty"`
+	SessionID SessionId      `json:"sessionId"`
+	Limit     int            `json:"limit,omitempty"`
+	Before    int            `json:"before,omitempty"`
+}
+
+// ListMessagesResponse is the result of listing a session's messages.
+type ListMessagesResponse struct {
+	Meta     map[string]any `json:"_meta,omitempty"`
+	Messages []Message      `json:"messages"`
+}
+
+// ── ListConfigOptions ──
+
+// ListConfigOptionsRequest asks for the session config options (mode,
+// thought level, model selector) a fresh session would receive, without
+// creating one: session/list_config_options. Cold-start pickers read this
+// instead of paying a session/new round-trip.
+type ListConfigOptionsRequest struct {
+	Meta map[string]any `json:"_meta,omitempty"`
+}
+
+// ListConfigOptionsResponse is the result of listing config options.
+type ListConfigOptionsResponse struct {
+	Meta          map[string]any        `json:"_meta,omitempty"`
+	ConfigOptions []SessionConfigOption `json:"configOptions,omitempty"`
+}
+
+// Message is a lightweight ACP view of one stored conversation message,
+// kept protocol-independent of the kernel's message types.
+type Message struct {
+	Role             string        `json:"role"`
+	Content          string        `json:"content,omitempty"`
+	ReasoningContent string        `json:"reasoningContent,omitempty"`
+	ToolCalls        []ToolCallRef `json:"toolCalls,omitempty"`
+	ToolCallID       string        `json:"toolCallId,omitempty"` // tool results
+	CreatedAt        string        `json:"createdAt,omitempty"`  // ISO 8601
+}
+
+// ToolCallRef is a compact tool-call reference inside a listed message.
+type ToolCallRef struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Args string `json:"args,omitempty"` // raw JSON arguments
+}
+
 // ── Prompt ──
 
 // PromptRequest is the input for a prompt turn.
@@ -453,6 +506,19 @@ type McpServer struct {
 	Env     []EnvVariable  `json:"env,omitempty"`     // stdio
 	URL     string         `json:"url,omitempty"`     // http / sse
 	Headers []HttpHeader   `json:"headers,omitempty"` // http / sse
+}
+
+// McpServerStatus is one row of the "mcp_servers_update" snapshot: a
+// session's configured MCP server with its connect outcome. Status is
+// "connected" or "failed" (failed connections are logged server-side and
+// never fatal — MCP is an optional enhancement). Tools counts the tools
+// imported from the server at connect time.
+type McpServerStatus struct {
+	Meta   map[string]any `json:"_meta,omitempty"`
+	Name   string         `json:"name"`
+	Type   string         `json:"type,omitempty"`  // ""=stdio, "http", "sse"
+	Status string         `json:"status"`          // "connected" | "failed"
+	Tools  int            `json:"tools,omitempty"` // imported tool count
 }
 
 // HttpHeader is a name-value pair for HTTP requests.
@@ -595,6 +661,17 @@ type AvailableCommand struct {
 type AvailableCommandInput struct {
 	Meta map[string]any `json:"_meta,omitempty"`
 	Hint string         `json:"hint"`
+}
+
+// AvailableSkill describes a skill the agent has loaded (builtin or
+// discovered from disk). Sent via available_skills_update so the client
+// can render a skill panel or autocomplete @skill mentions.
+type AvailableSkill struct {
+	Meta        map[string]any `json:"_meta,omitempty"`
+	Name        string         `json:"name"`
+	Description string         `json:"description"`
+	Path        string         `json:"path,omitempty"` // absolute path to skill directory; empty for builtin
+	Type        string         `json:"type"`           // "builtin", "global", "project"
 }
 
 // AvailableCommandsUpdate is the payload for sessionUpdate "available_commands_update".
@@ -828,6 +905,9 @@ type SessionUpdate struct {
 	// available_commands_update
 	AvailableCommands []AvailableCommand `json:"availableCommands,omitempty"`
 
+	// available_skills_update
+	AvailableSkills []AvailableSkill `json:"availableSkills,omitempty"`
+
 	// current_mode_update
 	CurrentModeID SessionModeId `json:"currentModeId,omitempty"`
 
@@ -840,6 +920,9 @@ type SessionUpdate struct {
 	// usage_update token counters
 	Used *int `json:"used,omitempty"`
 	Size *int `json:"size,omitempty"`
+
+	// mcp_servers_update
+	McpServers []McpServerStatus `json:"mcpServers,omitempty"`
 
 	// session_info_update — per ACP spec the fields are flat inside the
 	// update object, not nested under a wrapper struct.
@@ -982,6 +1065,23 @@ type SessionUpdateSender interface {
 // SetClientRequester before any other handler method.
 type ClientRPCUser interface {
 	SetClientRequester(r ClientRequester)
+}
+
+// TurnTrigger is a function the handler can call to start a turn on a session
+// without a client prompt — e.g. when an async sub-agent completes and the
+// model needs to process the result while the user is idle. It acquires the
+// same per-session lock as a client prompt (sessionLocks), so the triggered
+// turn is fully serialized with user turns — no concurrent turns on the same
+// session. The text becomes the prompt input (a <system-reminder> block for
+// sub-agent completions). Returns when the turn finishes.
+type TurnTrigger func(sid SessionId, text string)
+
+// TurnTriggerUser is an optional interface that AgentHandler implementations
+// may satisfy. The Server detects it at construction time and calls
+// SetTurnTrigger before any other handler method, injecting a function the
+// handler can call to start idle turns.
+type TurnTriggerUser interface {
+	SetTurnTrigger(trigger TurnTrigger)
 }
 
 // rpcResponse is a JSON-RPC 2.0 response — either Result or Error is set.

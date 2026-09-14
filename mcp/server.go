@@ -7,8 +7,8 @@ import (
 	"log/slog"
 	"net/http"
 
-	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 	hwcloud "github.com/Cloud-Developer-Department/hwcloud"
+	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // Server exposes hwcloud.Tool instances as an MCP server.
