@@ -181,14 +181,12 @@ export default async function LandingPage({
         {/* TUI — 跟 CLI 平行的交互式客户端 */}
         <h3 className="mb-2 mt-6 font-semibold text-text">{t("tuiTitle")}</h3>
         <p className="mb-3 text-sm text-muted">{t("tuiDesc")}</p>
-        <CodeBlock label="bash">{`# Build the TUI (Rust + ratatui)
-cd tui && cargo build --release
+        <CodeBlock label="bash">{`# The TUI is built into the Go binary as the 'tui' subcommand
+# (bubbletea + lipgloss — no separate Rust binary, no cargo)
+./build.sh            # or: go build -o hwcloud ./cmd/cli/
 
 # Launch — defaults to 'hwcloud serve --acp' as backend
-./target/release/hwcloud-tui
-
-# Or point at any ACP backend
-./target/release/hwcloud-tui --backend "opencode acp"`}</CodeBlock>
+./hwcloud tui`}</CodeBlock>
 
         <h3 className="mb-2 mt-6 font-semibold text-text">{t("configTitle")}</h3>
         <CodeBlock label="json">{`{

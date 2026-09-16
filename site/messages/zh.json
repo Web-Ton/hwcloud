@@ -157,7 +157,7 @@
       "desc": "通过 MCP 协议在 AI 对话中部署云基础设施 — 规划、规格、估价、部署、销毁，全程自然语言。"
     },
     "tuiTitle": "TUI",
-    "tuiDesc": "想要终端界面而不是裸 CLI？hwcloud 还自带一个 Rust ratatui TUI 客户端（ACP over stdio）——构建后可指向任意 ACP 后端。"
+    "tuiDesc": "想要终端界面而不是裸 CLI？hwcloud 自带一个 Go bubbletea TUI（ACP over stdio），作为 `tui` 子命令内置于同一个二进制——运行 `hwcloud tui`，它会自动拉起 `hwcloud serve --acp` 作为后端。"
   },
   "docs": {
     "sidebarTitle": "hwcloud",
@@ -826,6 +826,7 @@
         "生成 plan — 写 Terraform 配置，执行 terraform init + plan。",
         "估成本 — 查询 BSS 定价，返回月费估算。",
         "apply — 执行 terraform apply，创建真实云资源。",
+        "查漂移 — 执行 terraform plan -detailed-exitcode，检测真实云资源是否偏离了期望状态。",
         "销毁 — 执行 terraform destroy，清理所有资源。"
       ],
       "caseTitle": "使用案例：部署一台最小 ECS",

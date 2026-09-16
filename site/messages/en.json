@@ -157,7 +157,7 @@
       "desc": "Deploy cloud infrastructure from AI chat via MCP — plan, provision, estimate cost, apply, and destroy, all in natural language."
     },
     "tuiTitle": "TUI",
-    "tuiDesc": "Prefer a terminal UI over raw CLI? hwcloud also ships a Rust ratatui TUI client (ACP over stdio) — build it and point it at any ACP backend."
+    "tuiDesc": "Prefer a terminal UI over raw CLI? hwcloud ships a Go bubbletea TUI (ACP over stdio) built into the binary as the 'tui' subcommand — run `hwcloud tui` and it spawns `hwcloud serve --acp` as its backend."
   },
   "docs": {
     "sidebarTitle": "hwcloud",
@@ -826,6 +826,7 @@
         "Generate plan — write Terraform config, run terraform init + plan.",
         "Estimate cost — query BSS pricing, return a monthly cost estimate.",
         "Apply — run terraform apply, create real cloud resources.",
+        "Check drift — run terraform plan -detailed-exitcode to detect whether real cloud resources have drifted from the desired state.",
         "Destroy — run terraform destroy, clean up all resources."
       ],
       "caseTitle": "Example: deploy a minimal ECS",
